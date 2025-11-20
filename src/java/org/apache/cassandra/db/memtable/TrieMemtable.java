@@ -83,7 +83,7 @@ public class TrieMemtable extends AbstractAllocatorMemtable
     private static final Logger logger = LoggerFactory.getLogger(TrieMemtable.class);
     public static final String TRIE_MEMTABLE_CONFIG_OBJECT_NAME = "org.apache.cassandra.db:type=TrieMemtableConfig";
 
-    public static final Factory FACTORY = new TrieMemtable.Factory();
+    public static final TrieMemtable.Factory FACTORY = new TrieMemtable.Factory();
 
     /// Buffer type to use for memtable tries (on- vs off-heap)
     public static final BufferType BUFFER_TYPE;
@@ -114,7 +114,7 @@ public class TrieMemtable extends AbstractAllocatorMemtable
 
     /// Set to true when the memtable requests a switch (e.g. for trie size limit being reached) to ensure only one
     /// thread calls cfs.switchMemtableIfCurrent.
-    private AtomicBoolean switchRequested = new AtomicBoolean(false);
+    private final AtomicBoolean switchRequested = new AtomicBoolean(false);
 
 
     /// The boundaries for the keyspace as they were calculated when the memtable is created.
@@ -193,7 +193,7 @@ public class TrieMemtable extends AbstractAllocatorMemtable
         return DeletionAwareTrie.mergeDistinct(tries);
     }
 
-    protected Factory factory()
+    protected Memtable.Factory factory()
     {
         return FACTORY;
     }
@@ -451,7 +451,7 @@ public class TrieMemtable extends AbstractAllocatorMemtable
         private int rowCountIncludingStatic;
         private int tombstoneCount;
 
-        public static final long HEAP_SIZE = ObjectSizes.measure(new PartitionData((MemtableShard) null));
+        public static final long HEAP_SIZE = ObjectSizes.measure(new PartitionData(null));
 
         public PartitionData(MemtableShard owner)
         {
@@ -500,6 +500,12 @@ public class TrieMemtable extends AbstractAllocatorMemtable
         {
             return HEAP_SIZE;
         }
+
+        public void clearStats()
+        {
+            rowCountIncludingStatic = 0;
+            tombstoneCount = 0;
+        }
     }
 
     class KeySizeAndCountCollector extends TrieEntriesWalker<Object, Void>
@@ -536,7 +542,7 @@ public class TrieMemtable extends AbstractAllocatorMemtable
         int partitionCount = counter.keyCount;
         long partitionKeySize = counter.keySize;
 
-        return new AbstractFlushCollection<TrieBackedPartition>()
+        return new AbstractFlushCollection<>()
         {
             public Memtable memtable()
             {
@@ -586,7 +592,7 @@ public class TrieMemtable extends AbstractAllocatorMemtable
         private volatile int partitionCount = 0;
 
         @Unmetered
-        private ReentrantLock writeLock = new ReentrantLock(SHARD_LOCK_FAIRNESS);
+        private final ReentrantLock writeLock = new ReentrantLock(SHARD_LOCK_FAIRNESS);
 
         /// Content map for the given shard. This is implemented as an in-memory trie which uses the prefix-free
         /// byte-comparable [ByteSource] representations of keys to address partitions and individual rows within
@@ -706,12 +712,12 @@ public class TrieMemtable extends AbstractAllocatorMemtable
 
         void updateLiveDataSize(long size)
         {
-            liveDataSize = liveDataSize + size;
+            liveDataSize += size;
         }
 
         private void updateCurrentOperations(long op)
         {
-            currentOperations = currentOperations + op;
+            currentOperations += op;
         }
 
         public int partitionCount()
@@ -887,7 +893,7 @@ public class TrieMemtable extends AbstractAllocatorMemtable
             {
                 try
                 {
-                    SHARD_COUNT = Integer.valueOf(shardCount);
+                    SHARD_COUNT = Integer.parseInt(shardCount);
                     CassandraRelevantProperties.TRIE_MEMTABLE_SHARD_COUNT.setInt(SHARD_COUNT);
                 }
                 catch (NumberFormatException ex)
