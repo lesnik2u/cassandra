@@ -36,8 +36,6 @@ import org.apache.cassandra.db.BufferDecoratedKey;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DataRange;
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.DeletionInfo;
-import org.apache.cassandra.db.MutableDeletionInfo;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
@@ -46,15 +44,17 @@ import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.partitions.AbstractUnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.Partition;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
-import org.apache.cassandra.db.partitions.TrieBackedPartitionStage2;
-import org.apache.cassandra.db.partitions.TriePartitionUpdateStage2;
-import org.apache.cassandra.db.partitions.TriePartitionUpdaterStage2;
+import org.apache.cassandra.db.partitions.TrieBackedPartitionStage3;
+import org.apache.cassandra.db.partitions.TriePartitionUpdateStage3;
+import org.apache.cassandra.db.partitions.TriePartitionUpdaterStage3;
 import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.db.rows.TrieTombstoneMarker;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.tries.DeletionAwareTrie;
 import org.apache.cassandra.db.tries.Direction;
 import org.apache.cassandra.db.tries.InMemoryBaseTrie;
+import org.apache.cassandra.db.tries.InMemoryDeletionAwareTrie;
 import org.apache.cassandra.db.tries.InMemoryTrie;
-import org.apache.cassandra.db.tries.Trie;
 import org.apache.cassandra.db.tries.TrieEntriesWalker;
 import org.apache.cassandra.db.tries.TrieSpaceExhaustedException;
 import org.apache.cassandra.db.tries.TrieTailsIterator;
@@ -73,34 +73,16 @@ import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 import org.apache.cassandra.utils.bytecomparable.ByteSource;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.EnsureOnHeap;
-import org.apache.cassandra.utils.memory.HeapCloner;
 import org.apache.cassandra.utils.memory.MemtableAllocator;
 import org.github.jamm.Unmetered;
 
-/// Previous TrieMemtable implementation, provided for two reasons:
-///
-///   -  to easily compare current and earlier implementations of the trie memtable
-///   -  to have an option to change a database back to the older implementation if we find a bug or a performance
-///      problem with the new code.
-///
-///
-/// To switch a table to this version, use
-/// ```
-///   ALTER TABLE ... WITH memtable = {'class': 'TrieMemtableStage2'}
-/// ```
-/// or add
-/// ```
-///   memtable:
-///     class: TrieMemtableStage2
-/// ```
-/// in `cassandra.yaml` to switch a node to it as default.
-public class TrieMemtableStage2 extends AbstractAllocatorMemtable
+public class TrieMemtableStage3 extends AbstractAllocatorMemtable
 {
-    private static final Logger logger = LoggerFactory.getLogger(TrieMemtableStage2.class);
+    private static final Logger logger = LoggerFactory.getLogger(TrieMemtableStage3.class);
 
-    public static final Factory FACTORY = new TrieMemtableStage2.Factory();
+    public static final Factory FACTORY = new TrieMemtableStage3.Factory();
 
-    /** Buffer type to use for memtable tries (on- vs off-heap) */
+    /// Buffer type to use for memtable tries (on- vs off-heap)
     public static final BufferType BUFFER_TYPE;
 
     static
@@ -120,51 +102,42 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
         }
     }
 
-    /**
-     * Force copy checker (see InMemoryTrie.ApplyState) ensuring all modifications apply atomically and consistently to
-     * the whole partition.
-     */
-    public static final Predicate<InMemoryBaseTrie.NodeFeatures<Object>> FORCE_COPY_PARTITION_BOUNDARY = features -> isPartitionBoundary(features.content());
+    /// Force copy checker (see [InMemoryTrie#apply]) ensuring all modifications apply atomically and consistently to
+    /// the whole partition.
+    public static final Predicate<InMemoryBaseTrie.NodeFeatures<Object>> FORCE_COPY_PARTITION_BOUNDARY =
+        features -> TrieBackedPartitionStage3.isPartitionBoundary(features.content());
 
-    public static final Predicate<Object> IS_PARTITION_BOUNDARY = TrieMemtableStage2::isPartitionBoundary;
-
-    // Set to true when the memtable requests a switch (e.g. for trie size limit being reached) to ensure only one
-    // thread calls cfs.switchMemtableIfCurrent.
-    private AtomicBoolean switchRequested = new AtomicBoolean(false);
+    /// Set to true when the memtable requests a switch (e.g. for trie size limit being reached) to ensure only one
+    /// thread calls cfs.switchMemtableIfCurrent.
+    private final AtomicBoolean switchRequested = new AtomicBoolean(false);
 
 
-    // The boundaries for the keyspace as they were calculated when the memtable is created.
-    // The boundaries will be NONE for system keyspaces or if StorageService is not yet initialized.
-    // The fact this is fixed for the duration of the memtable lifetime, guarantees we'll always pick the same core
-    // for the a given key, even if we race with the StorageService initialization or with topology changes.
+    /// The boundaries for the keyspace as they were calculated when the memtable is created.
+    /// The boundaries will be `NONE` for system keyspaces or if `StorageService` is not yet initialized.
+    /// The fact this is fixed for the duration of the memtable lifetime, guarantees we'll always pick the same core
+    /// for the a given key, even if we race with the `StorageService` initialization or with topology changes.
     @Unmetered
     private final ShardBoundaries boundaries;
 
-    /**
-     * Core-specific memtable regions. All writes must go through the specific core. The data structures used
-     * are concurrent-read safe, thus reads can be carried out from any thread.
-     */
+    /// Core-specific memtable regions. All writes must go through the specific core. The data structures used
+    /// are concurrent-read safe, thus reads can be carried out from any thread.
     private final MemtableShard[] shards;
 
-    /**
-     * A merged view of the memtable map. Used for partition range queries and flush.
-     * For efficiency we serve single partition requests off the shard which offers more direct InMemoryTrie methods.
-     */
-    private final Trie<Object> mergedTrie;
+    /// A merged view of the memtable map. Used for partition range queries and flush.
+    /// For efficiency we serve single partition requests off the shard which offers more direct [InMemoryTrie] methods.
+    private final DeletionAwareTrie<Object, TrieTombstoneMarker> mergedTrie;
 
     @Unmetered
     private final TrieMemtableMetricsView metrics;
 
-    /**
-     * Keeps an estimate of the average row size in this memtable, computed from a small sample of rows.
-     * Because computing this estimate is potentially costly, as it requires iterating the rows,
-     * the estimate is updated only whenever the number of operations on the memtable increases significantly from the
-     * last update. This estimate is not very accurate but should be ok for planning or diagnostic purposes.
-     */
+    /// Keeps an estimate of the average row size in this memtable, computed from a small sample of rows.
+    /// Because computing this estimate is potentially costly, as it requires iterating the rows,
+    /// the estimate is updated only whenever the number of operations on the memtable increases significantly from the
+    /// last update. This estimate is not very accurate but should be ok for planning or diagnostic purposes.
     private volatile MemtableAverageRowSize estimatedAverageRowSize;
 
     // only to be used by init(), to setup the very first memtable for the cfs
-    TrieMemtableStage2(AtomicReference<CommitLogPosition> commitLogLowerBound, TableMetadataRef metadataRef, Owner owner)
+    TrieMemtableStage3(AtomicReference<CommitLogPosition> commitLogLowerBound, TableMetadataRef metadataRef, Owner owner)
     {
         super(commitLogLowerBound, metadataRef, owner);
         this.boundaries = owner.localRangeSplits(TrieMemtable.shardCount());
@@ -189,15 +162,15 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
         return partitionMapContainer;
     }
 
-    private static Trie<Object> makeMergedTrie(MemtableShard[] shards)
+    private static DeletionAwareTrie<Object, TrieTombstoneMarker> makeMergedTrie(MemtableShard[] shards)
     {
-        List<Trie<Object>> tries = new ArrayList<>(shards.length);
+        List<DeletionAwareTrie<Object, TrieTombstoneMarker>> tries = new ArrayList<>(shards.length);
         for (MemtableShard shard : shards)
             tries.add(shard.data);
-        return Trie.mergeDistinct(tries);
+        return DeletionAwareTrie.mergeDistinct(tries);
     }
 
-    protected Factory factory()
+    protected Memtable.Factory factory()
     {
         return FACTORY;
     }
@@ -237,12 +210,12 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
         }
     }
 
-    /**
-     * Should only be called by ColumnFamilyStore.apply via Keyspace.apply, which supplies the appropriate
-     * OpOrdering.
-     *
-     * commitLogSegmentPosition should only be null if this is a secondary index, in which case it is *expected* to be null
-     */
+    /// Should only be called by [ColumnFamilyStore#apply] via `Keyspace#apply`, which supplies the appropriate
+    /// [OpOrder.Group].
+    ///
+    /// `commitLogSegmentPosition` should only be null if this is a secondary index, in which case it is *expected* to
+    /// be null.
+    @Override
     public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
     {
         DecoratedKey key = update.partitionKey();
@@ -314,17 +287,15 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
     public long getEstimatedAverageRowSize()
     {
         if (estimatedAverageRowSize == null || currentOperations.get() > estimatedAverageRowSize.operations * 1.5)
-            estimatedAverageRowSize = new MemtableAverageRowSize(this, mergedTrie);
+            estimatedAverageRowSize = new MemtableAverageRowSize(this, mergedTrie.contentOnlyTrie());
         return estimatedAverageRowSize.rowSize;
     }
 
-    /**
-     * Returns the minTS if one available, otherwise NO_MIN_TIMESTAMP.
-     *
-     * EncodingStats uses a synthetic epoch TS at 2015. We don't want to leak that (CASSANDRA-18118) so we return NO_MIN_TIMESTAMP instead.
-     *
-     * @return The minTS or NO_MIN_TIMESTAMP if none available
-     */
+    /// Returns the minimum timestamp if one available, otherwise `NO_MIN_TIMESTAMP`.
+    /// [EncodingStats] uses a synthetic epoch TS at 2015. We don't want to leak that (CASSANDRA-18118) so we return
+    /// `NO_MIN_TIMESTAMP` instead.
+    ///
+    /// @return The minTS or `NO_MIN_TIMESTAMP` if none available
     @Override
     public long getMinTimestamp()
     {
@@ -382,13 +353,6 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
         return statsCollector.get();
     }
 
-    static boolean isPartitionBoundary(Object content)
-    {
-        // In the trie we use PartitionData for the root of a partition, but PartitionUpdates come with DeletionInfo.
-        // Both are descendants of DeletionInfo.
-        return content instanceof DeletionInfo;
-    }
-
     public MemtableUnfilteredPartitionIterator makePartitionIterator(final ColumnFilter columnFilter, final DataRange dataRange)
     {
         AbstractBounds<PartitionPosition> keyRange = dataRange.keyRange();
@@ -397,8 +361,9 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
         boolean includeStart = isBound || keyRange instanceof IncludingExcludingBounds;
         boolean includeStop = isBound || keyRange instanceof Range;
 
-        Trie<Object> subMap = mergedTrie.subtrie(toComparableBound(keyRange.left, includeStart),
-                                                 toComparableBound(keyRange.right, !includeStop));
+        DeletionAwareTrie<Object, TrieTombstoneMarker> subMap =
+            mergedTrie.subtrie(toComparableBound(keyRange.left, includeStart),
+                               toComparableBound(keyRange.right, !includeStop));
 
         return new MemtableUnfilteredPartitionIterator(metadata(),
                                                        allocator.ensureOnHeap(),
@@ -419,11 +384,11 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
     public Partition getPartition(DecoratedKey key)
     {
         int shardIndex = boundaries.getShardForKey(key);
-        Trie<Object> trie = shards[shardIndex].data.tailTrie(key);
+        DeletionAwareTrie<Object, TrieTombstoneMarker> trie = shards[shardIndex].data.tailTrie(key);
         return createPartition(metadata(), allocator.ensureOnHeap(), key, trie);
     }
 
-    private static TrieBackedPartitionStage2 createPartition(TableMetadata metadata, EnsureOnHeap ensureOnHeap, DecoratedKey key, Trie<Object> trie)
+    private static TrieBackedPartitionStage3 createPartition(TableMetadata metadata, EnsureOnHeap ensureOnHeap, DecoratedKey key, DeletionAwareTrie<Object, TrieTombstoneMarker> trie)
     {
         if (trie == null)
             return null;
@@ -433,52 +398,43 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
         // PartitionData (because the attachment of a new or modified partition to the trie is atomic).
         assert holder != null : "Entry for " + key + " without associated PartitionData";
 
-        return TrieBackedPartitionStage2.create(key,
-                                          holder.columns(),
-                                          holder.stats(),
-                                          holder.rowCountIncludingStatic(),
-                                          trie,
-                                          metadata,
-                                          ensureOnHeap);
+        return TrieBackedPartitionStage3.create(key,
+                                                holder.columns(),
+                                                holder.stats(),
+                                                holder.rowCountIncludingStatic(),
+                                                holder.tombstoneCount(),
+                                                trie,
+                                                metadata,
+                                                ensureOnHeap);
     }
 
     private static DecoratedKey getPartitionKeyFromPath(TableMetadata metadata, ByteComparable path)
     {
         return BufferDecoratedKey.fromByteComparable(path,
-                                                     TrieBackedPartitionStage2.BYTE_COMPARABLE_VERSION,
+                                                     TrieBackedPartitionStage3.BYTE_COMPARABLE_VERSION,
                                                      metadata.partitioner);
     }
 
-    /**
-     * Metadata object signifying the root node of a partition. Holds the deletion information as well as a link
-     * to the owning subrange, which is used for compiling statistics and column sets.
-     *
-     * Descends from MutableDeletionInfo to permit tail tries to be passed directly to TrieBackedPartitionStage2.
-     */
-    public static class PartitionData extends MutableDeletionInfo
+    /// Metadata object signifying the root node of a partition. Holds row and tombstone counts as well as a link
+    /// to the owning subrange, which is used for compiling encoding statistics and column sets.
+    ///
+    /// Descends from [TrieBackedPartitionStage3.PartitionMarker] to permit tail tries to be passed directly to
+    /// [TrieBackedPartitionStage3].
+    public static class PartitionData implements TrieBackedPartitionStage3.PartitionMarker
     {
         @Unmetered
         public final MemtableShard owner;
 
         private int rowCountIncludingStatic;
+        private int tombstoneCount;
 
-        public static final long HEAP_SIZE = ObjectSizes.measure(new PartitionData(DeletionInfo.LIVE, null));
+        public static final long HEAP_SIZE = ObjectSizes.measure(new PartitionData(null));
 
-        public PartitionData(DeletionInfo deletion,
-                             MemtableShard owner)
+        public PartitionData(MemtableShard owner)
         {
-            super(deletion.getPartitionDeletion(), deletion.copyRanges(HeapCloner.instance));
             this.owner = owner;
             this.rowCountIncludingStatic = 0;
-        }
-
-        public PartitionData(PartitionData existing,
-                             DeletionInfo update)
-        {
-            // Start with the update content, to properly copy it
-            this(update, existing.owner);
-            rowCountIncludingStatic = existing.rowCountIncludingStatic;
-            add(existing);
+            this.tombstoneCount = 0;
         }
 
         public RegularAndStaticColumns columns()
@@ -496,24 +452,38 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
             return rowCountIncludingStatic;
         }
 
+        public int tombstoneCount()
+        {
+            return tombstoneCount;
+        }
+
         public void markInsertedRows(int howMany)
         {
             rowCountIncludingStatic += howMany;
         }
 
+        public void markAddedTombstones(int howMany)
+        {
+            tombstoneCount += howMany;
+        }
+
         @Override
         public String toString()
         {
-            return "partition " + super.toString();
+            return String.format("partition with %d rows and %d tombstones", rowCountIncludingStatic, tombstoneCount);
         }
 
-        @Override
         public long unsharedHeapSize()
         {
-            return super.unsharedHeapSize() + HEAP_SIZE - MutableDeletionInfo.EMPTY_SIZE;
+            return HEAP_SIZE;
+        }
+
+        public void clearStats()
+        {
+            rowCountIncludingStatic = 0;
+            tombstoneCount = 0;
         }
     }
-
 
     class KeySizeAndCountCollector extends TrieEntriesWalker<Object, Void>
     {
@@ -533,26 +503,27 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
             assert content instanceof PartitionData;
             ++keyCount;
             byte[] keyBytes = DecoratedKey.keyFromByteSource(ByteSource.preencoded(bytes, 0, byteLength),
-                                                             TrieBackedPartitionStage2.BYTE_COMPARABLE_VERSION,
+                                                             TrieBackedPartitionStage3.BYTE_COMPARABLE_VERSION,
                                                              metadata().partitioner);
             keySize += keyBytes.length;
         }
     }
 
-    public FlushCollection<TrieBackedPartitionStage2> getFlushSet(PartitionPosition from, PartitionPosition to)
+    @Override
+    public FlushCollection<TrieBackedPartitionStage3> getFlushSet(PartitionPosition from, PartitionPosition to)
     {
-        Trie<Object> toFlush = mergedTrie.subtrie(toComparableBound(from, true), toComparableBound(to, true));
+        DeletionAwareTrie<Object, TrieTombstoneMarker> toFlush = mergedTrie.subtrie(toComparableBound(from, true), toComparableBound(to, true));
 
         var counter = new KeySizeAndCountCollector(); // need to jump over tails keys
         toFlush.processSkippingBranches(Direction.FORWARD, counter);
         int partitionCount = counter.keyCount;
         long partitionKeySize = counter.keySize;
 
-        return new AbstractFlushCollection<TrieBackedPartitionStage2>()
+        return new AbstractFlushCollection<>()
         {
             public Memtable memtable()
             {
-                return TrieMemtableStage2.this;
+                return TrieMemtableStage3.this;
             }
 
             public PartitionPosition from()
@@ -570,7 +541,7 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
                 return partitionCount;
             }
 
-            public Iterator<TrieBackedPartitionStage2> iterator()
+            public Iterator<TrieBackedPartitionStage3> iterator()
             {
                 return new PartitionIterator(toFlush, metadata(), EnsureOnHeap.NOOP);
             }
@@ -598,22 +569,23 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
         private volatile int partitionCount = 0;
 
         @Unmetered
-        private ReentrantLock writeLock = new ReentrantLock(TrieMemtable.shardLockFairness());
+        private final ReentrantLock writeLock = new ReentrantLock(TrieMemtable.shardLockFairness());
 
-        // Content map for the given shard. This is implemented as a memtable trie which uses the prefix-free
-        // byte-comparable ByteSource representations of the keys to address the partitions.
-        //
-        // This map is used in a single-producer, multi-consumer fashion: only one thread will insert items but
-        // several threads may read from it and iterate over it. Iterators (especially partition range iterators)
-        // may operate for a long period of time and thus iterators should not throw ConcurrentModificationExceptions
-        // if the underlying map is modified during iteration, they should provide a weakly consistent view of the map
-        // instead.
-        //
-        // Also, this data is backed by memtable memory, when accessing it callers must specify if it can be accessed
-        // unsafely, meaning that the memtable will not be discarded as long as the data is used, or whether the data
-        // should be copied on heap for off-heap allocators.
+        /// Content map for the given shard. This is implemented as an in-memory trie which uses the prefix-free
+        /// byte-comparable [ByteSource] representations of keys to address partitions and individual rows within
+        /// partitions.
+        ///
+        /// This map is used in a single-producer, multi-consumer fashion: only one thread will insert items but
+        /// several threads may read from it and iterate over it. Iterators (especially partition range iterators)
+        /// may operate for a long period of time and thus iterators should not throw `ConcurrentModificationException`s
+        /// if the underlying map is modified during iteration, they should provide a weakly consistent view of the map
+        /// instead.
+        ///
+        /// Also, this data is backed by memtable memory, when accessing it callers must specify if it can be accessed
+        /// unsafely, meaning that the memtable will not be discarded as long as the data is used, or whether the data
+        /// should be copied on heap for off-heap allocators.
         @VisibleForTesting
-        final InMemoryTrie<Object> data;
+        final InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> data;
 
         RegularAndStaticColumns columns;
 
@@ -635,7 +607,7 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
         MemtableShard(TableMetadataRef metadata, MemtableAllocator allocator, TrieMemtableMetricsView metrics, OpOrder opOrder)
         {
             this.metadata = metadata;
-            this.data = InMemoryTrie.longLived(TrieBackedPartitionStage2.BYTE_COMPARABLE_VERSION, BUFFER_TYPE, opOrder);
+            this.data = InMemoryDeletionAwareTrie.longLived(TrieBackedPartitionStage3.BYTE_COMPARABLE_VERSION, BUFFER_TYPE, opOrder);
             this.columns = RegularAndStaticColumns.NONE;
             this.stats = EncodingStats.NO_STATS;
             this.allocator = allocator;
@@ -644,7 +616,7 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
 
         public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
         {
-            TriePartitionUpdaterStage2 updater = new TriePartitionUpdaterStage2(allocator.cloner(opGroup), indexer, metadata.get(), this);
+            TriePartitionUpdaterStage3 updater = new TriePartitionUpdaterStage3(allocator.cloner(opGroup), indexer, update.partitionLevelDeletion(), metadata.get(), this);
             boolean locked = writeLock.tryLock();
             if (locked)
             {
@@ -667,11 +639,14 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
                     // the allocator to block while we are trying to flush a memtable and become a deadlock.
                     long onHeap = data.isEmpty() ? 0 : data.usedSizeOnHeap();
                     long offHeap = data.isEmpty() ? 0 : data.usedSizeOffHeap();
-                    // Use the fast recursive put if we know the key is small enough to not cause a stack overflow.
                     try
                     {
-                        data.apply(TriePartitionUpdateStage2.asMergableTrie(update),
+                        data.apply(TriePartitionUpdateStage3.asMergableTrie(update),
                                    updater,
+                                   updater::mergeMarkers,
+                                   updater::applyIncomingMarker,
+                                   updater::applyExistingMarkerToIncomingRow,
+                                   true,
                                    FORCE_COPY_PARTITION_BOUNDARY);
                     }
                     catch (TrieSpaceExhaustedException e)
@@ -714,12 +689,12 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
 
         void updateLiveDataSize(long size)
         {
-            liveDataSize = liveDataSize + size;
+            liveDataSize += size;
         }
 
         private void updateCurrentOperations(long op)
         {
-            currentOperations = currentOperations + op;
+            currentOperations += op;
         }
 
         public int partitionCount()
@@ -739,6 +714,7 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
 
         private DecoratedKey firstPartitionKey(Direction direction)
         {
+            // Note: there is no need to skip tails here as this will only be run until we find the first partition.
             Iterator<Map.Entry<ByteComparable.Preencoded, PartitionData>> iter = data.filteredEntryIterator(direction, PartitionData.class);
             if (!iter.hasNext())
                 return null;
@@ -758,11 +734,11 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
         }
     }
 
-    static class PartitionIterator extends TrieTailsIterator.Plain<Object, TrieBackedPartitionStage2>
+    static class PartitionIterator extends TrieTailsIterator.DeletionAware<Object, TrieTombstoneMarker, TrieBackedPartitionStage3>
     {
         final TableMetadata metadata;
         final EnsureOnHeap ensureOnHeap;
-        PartitionIterator(Trie<Object> source, TableMetadata metadata, EnsureOnHeap ensureOnHeap)
+        PartitionIterator(DeletionAwareTrie<Object, TrieTombstoneMarker> source, TableMetadata metadata, EnsureOnHeap ensureOnHeap)
         {
             super(source, Direction.FORWARD, PartitionData.class::isInstance);
             this.metadata = metadata;
@@ -770,33 +746,34 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
         }
 
         @Override
-        protected TrieBackedPartitionStage2 mapContent(Object content, Trie<Object> tailTrie, byte[] bytes, int byteLength)
+        protected TrieBackedPartitionStage3 mapContent(Object content, DeletionAwareTrie<Object, TrieTombstoneMarker> tailTrie, byte[] bytes, int byteLength)
         {
             PartitionData pd = (PartitionData) content;
             DecoratedKey key = getPartitionKeyFromPath(metadata,
-                                                       ByteComparable.preencoded(TrieBackedPartitionStage2.BYTE_COMPARABLE_VERSION,
+                                                       ByteComparable.preencoded(TrieBackedPartitionStage3.BYTE_COMPARABLE_VERSION,
                                                                                  bytes, 0, byteLength));
-            return TrieBackedPartitionStage2.create(key,
-                                              pd.columns(),
-                                              pd.stats(),
-                                              pd.rowCountIncludingStatic(),
-                                              tailTrie,
-                                              metadata,
-                                              ensureOnHeap);
+            return TrieBackedPartitionStage3.create(key,
+                                                    pd.columns(),
+                                                    pd.stats(),
+                                                    pd.rowCountIncludingStatic(),
+                                                    pd.tombstoneCount(),
+                                                    tailTrie,
+                                                    metadata,
+                                                    ensureOnHeap);
         }
     }
 
     static class MemtableUnfilteredPartitionIterator extends AbstractUnfilteredPartitionIterator implements Memtable.MemtableUnfilteredPartitionIterator
     {
         private final TableMetadata metadata;
-        private final Iterator<TrieBackedPartitionStage2> iter;
+        private final Iterator<TrieBackedPartitionStage3> iter;
         private final ColumnFilter columnFilter;
         private final DataRange dataRange;
         private final int minLocalDeletionTime;
 
         public MemtableUnfilteredPartitionIterator(TableMetadata metadata,
                                                    EnsureOnHeap ensureOnHeap,
-                                                   Trie<Object> source,
+                                                   DeletionAwareTrie<Object, TrieTombstoneMarker> source,
                                                    ColumnFilter columnFilter,
                                                    DataRange dataRange,
                                                    int minLocalDeletionTime)
@@ -839,13 +816,13 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
                                TableMetadataRef metadaRef,
                                Owner owner)
         {
-            return new TrieMemtableStage2(commitLogLowerBound, metadaRef, owner);
+            return new TrieMemtableStage3(commitLogLowerBound, metadaRef, owner);
         }
 
         @Override
         public PartitionUpdate.Factory partitionUpdateFactory()
         {
-            return TriePartitionUpdateStage2.FACTORY;
+            return TriePartitionUpdateStage3.FACTORY;
         }
 
         @Override
@@ -869,10 +846,8 @@ public class TrieMemtableStage2 extends AbstractAllocatorMemtable
         return size;
     }
 
-    /**
-     * Release all recycled content references, including the ones waiting in still incomplete recycling lists.
-     * This is a test method and can cause null pointer exceptions if used on a live trie.
-     */
+    /// Release all recycled content references, including the ones waiting in still incomplete recycling lists.
+    /// This is a test method and can cause null pointer exceptions if used on a live trie.
     @VisibleForTesting
     void releaseReferencesUnsafe()
     {
