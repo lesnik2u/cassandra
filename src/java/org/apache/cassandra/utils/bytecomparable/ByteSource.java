@@ -249,6 +249,22 @@ public interface ByteSource
     }
 
     /**
+     * Produce a source for an unsigned integer, stored using variable length encoding.
+     * The representation uses between 1 and 9 bytes, is prefix-free and compares
+     * correctly.
+     */
+    static ByteSource variableLengthUnsignedInteger(long value)
+    {
+        return new VariableLengthUnsignedInteger(value);
+    }
+
+    /// Returns the direct concatenation of sources (no separators or terminators are added).
+    static ByteSource concat(ByteSource... sources)
+    {
+        return new Concat(sources);
+    }
+
+    /**
      * Returns a separator for two byte sources, i.e. something that is definitely > prevMax, and <= currMin, assuming
      * prevMax < currMin.
      * This returns the shortest prefix of currMin that is greater than prevMax.
@@ -326,7 +342,7 @@ public interface ByteSource
      * Variable-length encoding. Escapes 0s as ESCAPE + zero or more ESCAPED_0_CONT + ESCAPED_0_DONE.
      * If the source ends in 0, we use ESCAPED_0_CONT to make sure that the encoding remains smaller than that source
      * with a further 0 at the end.
-     * Finishes in an escaped state (either with ESCAPE or ESCAPED_0_CONT), which in {@link Multi} is followed by
+     * Finishes in an escaped state (either with ESCAPE or ESCAPED_0_CONT), which in {@link Concat} is followed by
      * a component separator between 0x10 and 0xFE.
      *
      * E.g. "A\0\0B" translates to 4100FEFF4200
@@ -716,6 +732,34 @@ public interface ByteSource
             if (srcs[srcnum] == null)
                 return NEXT_COMPONENT_NULL;
             return NEXT_COMPONENT;
+        }
+    }
+
+    /**
+     * Direct concatenation of byte sources.
+     */
+    static class Concat implements ByteSource
+    {
+        private final ByteSource[] srcs;
+        private int srcnum = 0;
+
+        Concat(ByteSource[] srcs)
+        {
+            this.srcs = srcs;
+        }
+
+        @Override
+        public int next()
+        {
+            while (true)
+            {
+                if (srcnum == srcs.length)
+                    return END_OF_STREAM;
+                int b = srcs[srcnum].next();
+                if (b > END_OF_STREAM)
+                    return b;
+                ++srcnum;
+            }
         }
     }
 

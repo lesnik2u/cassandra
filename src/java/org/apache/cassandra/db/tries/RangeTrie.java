@@ -21,6 +21,8 @@ import java.util.Collection;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.function.BiFunction;
+import java.util.function.Function;
+import java.util.function.Predicate;
 
 import com.google.common.base.Preconditions;
 
@@ -99,7 +101,13 @@ public interface RangeTrie<S extends RangeState<S>> extends BaseTrie<S, RangeCur
         RangeCursor<S> cursor = cursor(Direction.FORWARD);
         final ByteSource bytes = key.asComparableBytes(cursor.byteComparableVersion());
         if (cursor.descendAlong(bytes))
-            return cursor.state();
+        {
+            S state = cursor.state();
+            if (state == null)
+                return null;
+            // If this is a boundary, the state that applies to the branch is its right side.
+            return state.succedingState(Direction.FORWARD);
+        }
         else
             return cursor.precedingState();
     }
@@ -118,6 +126,20 @@ public interface RangeTrie<S extends RangeState<S>> extends BaseTrie<S, RangeCur
     default RangeTrie<S> mergeWith(RangeTrie<S> other, Trie.MergeResolver<S> resolver)
     {
         return dir -> new MergeCursor.Range<>(resolver, cursor(dir), other.cursor(dir));
+    }
+
+    /// Constructs a view of the merge of this trie with the given one, applying a transformation over all values.
+    /// The view is live, i.e. any write to any of the sources will be reflected in the merged view.
+    ///
+    /// The resolver will be called for all content in any of the two source to transform it to the output type,
+    /// and one of its arguments will be null if the other source has no matching content.
+    default <E extends RangeState<E>, Q extends RangeState<Q>>
+    RangeTrie<Q> mappingMergeWith(RangeTrie<E> other,
+                                  BiFunction<S, E, Q> resolver)
+    {
+        return dir -> new MergeCursor.RangeMapping<>(resolver,
+                                                             cursor(dir),
+                                                             other.cursor(dir));
     }
 
     /// Constructs a view of the merge of multiple tries. The view is live, i.e. any write to any of the
@@ -176,11 +198,15 @@ public interface RangeTrie<S extends RangeState<S>> extends BaseTrie<S, RangeCur
             return null;
     }
 
-    /// Returns an entry set containing all tail tree constructed at the points that contain content of
-    /// the given type.
-    default Iterable<Map.Entry<ByteComparable.Preencoded, RangeTrie<S>>> tailTries(Direction direction, Class<? extends S> clazz)
+    @Override
+    default Iterable<Map.Entry<ByteComparable.Preencoded, RangeTrie<S>>> tailTries(Direction direction, Predicate<? super S> predicate)
     {
-        return () -> new TrieTailsIterator.AsEntriesRange<>(cursor(direction), clazz);
+        return () -> new TrieTailsIterator.AsEntriesRange<>(cursor(direction), predicate);
+    }
+
+    default <E extends RangeState<E>> RangeTrie<E> mapValues(Function<S, E> mapper)
+    {
+        return dir -> new ContentMappingCursor.Range<>(mapper, cursor(dir));
     }
 
     // The methods below form the non-public implementation, whose visibility is restricted to package-level.

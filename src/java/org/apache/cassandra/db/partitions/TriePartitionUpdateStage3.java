@@ -23,6 +23,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
+import com.google.common.base.Predicates;
 import com.google.common.primitives.Ints;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -151,7 +152,7 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
      */
     public static TriePartitionUpdateStage3 singleRowUpdate(TableMetadata metadata, DecoratedKey key, Row row)
     {
-        EncodingStats stats = EncodingStats.Collector.forRow(row);
+        EncodingStats stats = row.isEmpty() ? EncodingStats.NO_STATS : EncodingStats.Collector.forRow(row);
         InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie = newTrie();
 
         RegularAndStaticColumns columns;
@@ -270,7 +271,7 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
                     noIncomingSelfDeletion(),
                     noExistingSelfDeletion(),
                     true,
-                    x -> false);
+                    Predicates.alwaysFalse());
         }
         catch (TrieSpaceExhaustedException e)
         {
@@ -395,6 +396,7 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
         private final DecoratedKey key;
         private final RegularAndStaticColumns columns;
         private final InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie = InMemoryDeletionAwareTrie.shortLived(BYTE_COMPARABLE_VERSION);
+        private final InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>.Mutator<Row, TrieTombstoneMarker> mutator;
         private final EncodingStats.Collector statsCollector = new EncodingStats.Collector();
         private int rowCountIncludingStatic;
         private int tombstoneCount;
@@ -411,6 +413,13 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
             tombstoneCount = 0;
             dataSize = 0;
             cf = ColumnFilter.all(metadata);
+            mutator = trie.mutator(this::mergeIncomingRow,
+                                   this::mergeTombstones,
+                                   this::applyIncomingTombstone,
+                                   this::applyExistingTombstoneToIncomingRow,
+                                   true,
+                                   Predicates.alwaysFalse(),
+                                   Predicates.alwaysFalse());
         }
 
         /**
@@ -449,15 +458,7 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
                 }
                 if (!row.isEmptyAfterDeletion())
                 {
-                    trie.apply(DeletionAwareTrie.<Row, TrieTombstoneMarker>singleton(comparableClustering,
-                                                                                     BYTE_COMPARABLE_VERSION,
-                                                                                     row),
-                               this::mergeIncomingRow,
-                               this::mergeTombstones,
-                               this::applyIncomingTombstone,
-                               this::applyExistingTombstoneToIncomingRow,
-                               true,
-                               x -> false);
+                    mutator.apply(DeletionAwareTrie.singleton(comparableClustering, BYTE_COMPARABLE_VERSION, row));
                 }
             }
             catch (TrieSpaceExhaustedException e)
@@ -472,18 +473,10 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
         {
             try
             {
-                trie.apply(DeletionAwareTrie.deletionBranch(ByteComparable.EMPTY,
-                                                            BYTE_COMPARABLE_VERSION,
-                                                            RangeTrie.point(key,
-                                                                            BYTE_COMPARABLE_VERSION,
-                                                                            true,
-                                                                            TrieTombstoneMarker.point(deletionTime))),
-                           noConflictInData(),
-                           mergeTombstoneRanges(),
-                           noIncomingSelfDeletion(),
-                           noExistingSelfDeletion(),
-                           true,
-                           x -> false);
+                mutator.delete(RangeTrie.point(key,
+                                               BYTE_COMPARABLE_VERSION,
+                                               true,
+                                               TrieTombstoneMarker.point(TrieTombstoneMarker.PointDataType.ROW, deletionTime)));
             }
             catch (TrieSpaceExhaustedException e)
             {
@@ -495,17 +488,9 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
         {
             try
             {
-                trie.apply(DeletionAwareTrie.deletionBranch(ByteComparable.EMPTY,
-                                                            BYTE_COMPARABLE_VERSION,
-                                                            RangeTrie.branch(ByteComparable.EMPTY,
-                                                                             BYTE_COMPARABLE_VERSION,
-                                                                             TrieTombstoneMarker.covering(deletionTime))),
-                           noConflictInData(),
-                           mergeTombstoneRanges(),
-                           noIncomingSelfDeletion(),
-                           noExistingSelfDeletion(),
-                           true,
-                           x -> false);
+                mutator.delete(RangeTrie.branch(ByteComparable.EMPTY,
+                                                BYTE_COMPARABLE_VERSION,
+                                                TrieTombstoneMarker.covering(deletionTime)));
             }
             catch (TrieSpaceExhaustedException e)
             {
@@ -517,17 +502,10 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
         {
             try
             {
-                trie.apply(DeletionAwareTrie.deletedRange(ByteComparable.EMPTY,
-                                                          start,
-                                                          end,
-                                                          BYTE_COMPARABLE_VERSION,
-                                                          TrieTombstoneMarker.covering(deletionTime)),
-                           this::mergeIncomingRow,
-                           this::mergeTombstones,
-                           this::applyIncomingTombstone,
-                           this::applyExistingTombstoneToIncomingRow,
-                           true,
-                           x -> false);
+                mutator.delete(RangeTrie.range(start, true,
+                                               end, false,
+                                               BYTE_COMPARABLE_VERSION,
+                                               TrieTombstoneMarker.covering(deletionTime)));
                 statsCollector.update(deletionTime);
             }
             catch (TrieSpaceExhaustedException e)
@@ -635,7 +613,7 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
         @Override
         public DeletionTime partitionLevelDeletion()
         {
-            TrieTombstoneMarker applicableRange = trie.deletionOnlyTrie().applicableRange(STATIC_CLUSTERING_PATH);
+            TrieTombstoneMarker applicableRange = trie.deletionOnlyTrie().applicableRange(ByteComparable.EMPTY);
             return applicableRange != null ? applicableRange.deletionTime() : DeletionTime.LIVE;
         }
 

@@ -23,6 +23,7 @@ import java.util.Iterator;
 import java.util.List;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Predicates;
 import com.google.common.primitives.Ints;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -146,7 +147,7 @@ public class TriePartitionUpdateStage2 extends TrieBackedPartitionStage2 impleme
      */
     public static TriePartitionUpdateStage2 singleRowUpdate(TableMetadata metadata, DecoratedKey key, Row row)
     {
-        EncodingStats stats = EncodingStats.Collector.forRow(row);
+        EncodingStats stats = row.isEmpty() ? EncodingStats.NO_STATS : EncodingStats.Collector.forRow(row);
         InMemoryTrie<Object> trie = newTrie(DeletionInfo.LIVE);
 
         RegularAndStaticColumns columns;
@@ -275,7 +276,7 @@ public class TriePartitionUpdateStage2 extends TrieBackedPartitionStage2 impleme
                     mdi.updateAllTimestamp(newTimestamp - 1);
                     return mdi;
                 }
-            }, x -> false);
+            }, Predicates.alwaysFalse());
         }
         catch (TrieSpaceExhaustedException e)
         {

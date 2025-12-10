@@ -29,7 +29,6 @@ import org.agrona.concurrent.UnsafeBuffer;
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.utils.FastByteOperations;
 import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 import org.apache.cassandra.utils.bytecomparable.ByteSource;
@@ -1069,17 +1068,17 @@ public abstract class InMemoryBaseTrie<T> extends InMemoryReadTrie<T>
         }
 
         /// Advance to the given depth and transition. Returns false if the depth signals mutation cursor is exhausted.
-        boolean advanceTo(int depth, int transition, int forcedCopyDepth) throws TrieSpaceExhaustedException
+        boolean advanceTo(int depth, int transition, int forcedCopyDepth, Predicate<? super T> danglingMetadataCleaner) throws TrieSpaceExhaustedException
         {
-            return advanceTo(depth, transition, forcedCopyDepth, 0);
+            return advanceTo(depth, transition, forcedCopyDepth, 0, danglingMetadataCleaner);
         }
         /// Advance to the given depth and transition. Returns false if the depth signals mutation cursor is exhausted.
-        boolean advanceTo(int depth, int transition, int forcedCopyDepth, int ascendLimit) throws TrieSpaceExhaustedException
+        boolean advanceTo(int depth, int transition, int forcedCopyDepth, int ascendLimit, Predicate<? super T> danglingMetadataCleaner) throws TrieSpaceExhaustedException
         {
             while (currentDepth >= Math.max(ascendLimit + 1, depth))
             {
                 // There are no more children. Ascend to the parent state to continue walk.
-                attachAndMoveToParentState(forcedCopyDepth);
+                attachAndMoveToParentState(forcedCopyDepth, danglingMetadataCleaner);
             }
             if (depth <= ascendLimit)
                 return false;
@@ -1095,7 +1094,12 @@ public abstract class InMemoryBaseTrie<T> extends InMemoryReadTrie<T>
         ///
         /// The `limitDepth`, `limitTransition` and `limitIsOnReturnPath` parameters specify the limit position. This
         /// must be a valid non-exhausted position.
-        boolean advanceToNextExistingOr(int limitDepth, int limitTransition, boolean limitIsOnReturnPath, int forcedCopyDepth, int ascendLimit)
+        boolean advanceToNextExistingOr(int limitDepth,
+                                        int limitTransition,
+                                        boolean limitIsOnReturnPath,
+                                        int forcedCopyDepth,
+                                        int ascendLimit,
+                                        Predicate<? super T> danglingMetadataCleaner)
         throws TrieSpaceExhaustedException
         {
             assert limitDepth >= ascendLimit;
@@ -1118,12 +1122,13 @@ public abstract class InMemoryBaseTrie<T> extends InMemoryReadTrie<T>
                     (limitDepth == ascendLimit || transitionAtDepth(currentDepth - 1) == limitTransition))
                     return false;
 
-                attachAndMoveToParentState(forcedCopyDepth);
+                attachAndMoveToParentState(forcedCopyDepth, danglingMetadataCleaner);
             }
         }
 
         /// Advance to the next existing position in the trie.
-        boolean advanceToNextExisting(int forcedCopyDepth, int ascendLimit) throws TrieSpaceExhaustedException
+        boolean advanceToNextExisting(int forcedCopyDepth, int ascendLimit, Predicate<? super T> danglingMetadataCleaner)
+        throws TrieSpaceExhaustedException
         {
             while (true)
             {
@@ -1138,7 +1143,7 @@ public abstract class InMemoryBaseTrie<T> extends InMemoryReadTrie<T>
                 if (currentDepth <= ascendLimit)
                     return false;
 
-                attachAndMoveToParentState(forcedCopyDepth);
+                attachAndMoveToParentState(forcedCopyDepth, danglingMetadataCleaner);
             }
         }
 
@@ -1235,7 +1240,8 @@ public abstract class InMemoryBaseTrie<T> extends InMemoryReadTrie<T>
 
         /// Apply the collected content to a node. If there is content to add, converts `NONE` to a leaf node, and adds
         /// or updates a prefix for all others.
-        protected int applyContent(boolean forcedCopy) throws TrieSpaceExhaustedException
+        protected int applyContent(boolean forcedCopy, Predicate<? super T> danglingMetadataCleaner)
+        throws TrieSpaceExhaustedException
         {
             // Note: the old content id itself is already released by setContent. Here we must release any standalone
             // prefix nodes that may reference it.
@@ -1247,6 +1253,14 @@ public abstract class InMemoryBaseTrie<T> extends InMemoryReadTrie<T>
             // applyPrefixChange does not understand leaf nodes, handle upgrade from and to one explicitly.
             if (isNull(updatedPostContentNode))
             {
+                // This node has no children. If the content is metadata that has no meaning if no children exist,
+                // remove it.
+                if (!isNull(contentId) && danglingMetadataCleaner.test(trie.getContent(contentId)))
+                {
+                    trie.releaseContent(contentId);
+                    contentId = NONE;
+                }
+
                 if (existingPreContentNode != existingPostContentNode
                     && !isNullOrLeaf(existingPreContentNode)
                     && !trie.isEmbeddedPrefixNode(existingPreContentNode))
@@ -1327,9 +1341,9 @@ public abstract class InMemoryBaseTrie<T> extends InMemoryReadTrie<T>
         /// After a node's children are processed, this is called to ascend from it. This means applying the collected
         /// content to the compiled `updatedPostContentNode` and creating a mapping in the parent to it (or updating if
         /// one already exists).
-        void attachAndMoveToParentState(int forcedCopyDepth) throws TrieSpaceExhaustedException
+        void attachAndMoveToParentState(int forcedCopyDepth, Predicate<? super T> danglingMetadataCleaner) throws TrieSpaceExhaustedException
         {
-            attachBranchAndMoveToParentState(applyContent(currentDepth >= forcedCopyDepth), forcedCopyDepth);
+            attachBranchAndMoveToParentState(applyContent(currentDepth >= forcedCopyDepth, danglingMetadataCleaner), forcedCopyDepth);
         }
 
         void attachBranchAndMoveToParentState(int updatedFullNode, int forcedCopyDepth) throws TrieSpaceExhaustedException {
@@ -1342,9 +1356,9 @@ public abstract class InMemoryBaseTrie<T> extends InMemoryReadTrie<T>
         }
 
         /// Ascend and update the root at the end of processing.
-        void attachAndUpdateRoot(int forcedCopyDepth) throws TrieSpaceExhaustedException
+        void attachAndUpdateRoot(int forcedCopyDepth, Predicate<? super T> danglingMetadataCleaner) throws TrieSpaceExhaustedException
         {
-            attachRoot(applyContent(0 >= forcedCopyDepth), forcedCopyDepth);
+            attachRoot(applyContent(0 >= forcedCopyDepth, danglingMetadataCleaner), forcedCopyDepth);
         }
 
         void attachRoot(int updatedFullNode, int ignoredForcedCopyDepth)
@@ -1513,28 +1527,43 @@ public abstract class InMemoryBaseTrie<T> extends InMemoryReadTrie<T>
         T content();
     }
 
-    static class Mutation<T, U, C extends Cursor<U>, A extends ApplyState<T>> implements NodeFeatures<U>
+    protected static class Mutator<T, U, C extends Cursor<U>, A extends ApplyState<T>> implements NodeFeatures<U>
     {
         final UpsertTransformerWithKeyProducer<T, U> transformer;
         final Predicate<NodeFeatures<U>> needsForcedCopy;
-        final C mutationCursor;
+        final Predicate<? super T> danglingMetadataCleaner;
         final A state;
+
+        C mutationCursor;
         int forcedCopyDepth;
 
-        Mutation(UpsertTransformerWithKeyProducer<T, U> transformer,
-                 Predicate<NodeFeatures<U>> needsForcedCopy,
-                 C mutationCursor,
-                 A state)
+        Mutator(UpsertTransformerWithKeyProducer<T, U> transformer,
+                Predicate<NodeFeatures<U>> needsForcedCopy,
+                Predicate<? super T> danglingMetadataCleaner,
+                A state)
         {
-            mutationCursor.assertFresh();
             this.transformer = transformer;
             this.needsForcedCopy = needsForcedCopy;
-            this.mutationCursor = mutationCursor;
+            this.danglingMetadataCleaner = danglingMetadataCleaner;
             this.state = state;
-            this.forcedCopyDepth = Integer.MAX_VALUE;
         }
 
-        void apply() throws TrieSpaceExhaustedException
+        Mutator<T, U, C, A> start(int root, C mutationCursor, int initialForcedCopyDepth)
+        {
+            mutationCursor.assertFresh();
+
+            this.mutationCursor = mutationCursor;
+            this.forcedCopyDepth = initialForcedCopyDepth;
+            this.state.start(root);
+            return this;
+        }
+
+        Mutator<T, U, C, A> start(C mutationCursor)
+        {
+            return start(state.trie.root, mutationCursor, Integer.MAX_VALUE);
+        }
+
+        Mutator<T, U, C, A> apply() throws TrieSpaceExhaustedException
         {
             int depth = state.currentDepth;
             while (true)
@@ -1542,27 +1571,27 @@ public abstract class InMemoryBaseTrie<T> extends InMemoryReadTrie<T>
                 if (depth < forcedCopyDepth)
                     forcedCopyDepth = needsForcedCopy.test(this) ? depth : Integer.MAX_VALUE;
 
-                applyContent();
+                applyContent(mutationCursor.content());
 
                 long position = mutationCursor.advance();
                 assert !Cursor.isOnReturnPath(position) : "Return path in forward direction can only be used in range tries.";
                 depth = Cursor.depth(position);
-                if (!state.advanceTo(depth, Cursor.incomingTransition(position), forcedCopyDepth))
+                if (!state.advanceTo(depth, Cursor.incomingTransition(position), forcedCopyDepth, danglingMetadataCleaner))
                     break;
                 assert state.currentDepth == depth : "Unexpected change to applyState. Concurrent trie modification?";
             }
+            return this;
         }
 
-        void applyContent() throws TrieSpaceExhaustedException
+        void applyContent(U content) throws TrieSpaceExhaustedException
         {
-            U content = mutationCursor.content();
             if (content != null)
             {
                 T existingContent = state.getDescentPathContent();
                 T combinedContent = transformer.apply(existingContent, content, state);
                 if (combinedContent != existingContent)
-                    state.setDescentPathContent(combinedContent, // can be null
-                                                state.currentDepth >= forcedCopyDepth); // this is called at the start of processing
+                state.setDescentPathContent(combinedContent, // can be null
+                                            state.currentDepth >= forcedCopyDepth); // this is called at the start of processing
             }
         }
 
@@ -1570,7 +1599,7 @@ public abstract class InMemoryBaseTrie<T> extends InMemoryReadTrie<T>
         void complete() throws TrieSpaceExhaustedException
         {
             assert state.currentDepth == 0 : "Unexpected change to applyState. Concurrent trie modification?";
-            state.attachAndUpdateRoot(forcedCopyDepth);
+            state.attachAndUpdateRoot(forcedCopyDepth, danglingMetadataCleaner);
         }
 
         @Override
@@ -1821,7 +1850,7 @@ public abstract class InMemoryBaseTrie<T> extends InMemoryReadTrie<T>
     }
 
     @VisibleForTesting
-    long usedBufferSpace()
+    public long usedBufferSpace()
     {
         return allocatedPos - cellAllocator.indexCountInPipeline() * CELL_SIZE;
     }

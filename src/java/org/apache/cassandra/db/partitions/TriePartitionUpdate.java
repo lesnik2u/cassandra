@@ -28,6 +28,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.Columns;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionInfo;
@@ -38,11 +39,13 @@ import org.apache.cassandra.db.RangeTombstone;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.Cells;
 import org.apache.cassandra.db.rows.ColumnData;
 import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.RangeTombstoneMarker;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Rows;
+import org.apache.cassandra.db.rows.TrieBackedRow;
 import org.apache.cassandra.db.rows.TrieTombstoneMarker;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.rows.UnfilteredRowIterators;
@@ -51,7 +54,6 @@ import org.apache.cassandra.db.tries.InMemoryDeletionAwareTrie;
 import org.apache.cassandra.db.tries.RangeTrie;
 import org.apache.cassandra.db.tries.TrieSpaceExhaustedException;
 import org.apache.cassandra.schema.TableMetadata;
-import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 
 /**
@@ -151,7 +153,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
      */
     public static TriePartitionUpdate singleRowUpdate(TableMetadata metadata, DecoratedKey key, Row row)
     {
-        EncodingStats stats = EncodingStats.Collector.forRow(row);
+        EncodingStats stats = row.isEmpty() ? EncodingStats.NO_STATS : EncodingStats.Collector.forRow(row);
         InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie = newTrie();
 
         RegularAndStaticColumns columns;
@@ -162,7 +164,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
 
         try
         {
-            putInTrie(metadata.comparator, trie, row);
+            putInTrie(metadata, metadata.comparator, trie, row);
         }
         catch (TrieSpaceExhaustedException e)
         {
@@ -250,17 +252,16 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
                     (shouldBeNull, o) ->
                     {
                         assert shouldBeNull == null;
-                        if (!(o instanceof RowData))
+                        if (o instanceof Cell<?>)
+                            return ((Cell<?>) o).updateAllTimestamp(newTimestamp);
+
+                        if (o instanceof LivenessInfo)
+                            return ((LivenessInfo) o).withUpdatedTimestamp(newTimestamp);
+
+                        if (o instanceof PartitionMarker)
                             return o;
-                        RowData update = (RowData) o;
 
-                        LivenessInfo newInfo = update.livenessInfo.isEmpty()
-                                               ? update.livenessInfo
-                                               : update.livenessInfo.withUpdatedTimestamp(newTimestamp);
-
-                        return new RowData(BTree.transformAndFilter(update.columnsBTree,
-                                                                    (ColumnData cd) -> cd.updateAllTimestamp(newTimestamp)),
-                                           newInfo);
+                        throw new AssertionError("Unexpected data in trie: " + o);
                     },
                     (shouldBeNull, o) ->
                     {
@@ -395,6 +396,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
         private final DecoratedKey key;
         private final RegularAndStaticColumns columns;
         private final InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie = InMemoryDeletionAwareTrie.shortLived(BYTE_COMPARABLE_VERSION);
+        private final InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>.Mutator<Object, TrieTombstoneMarker> mutator;
         private final EncodingStats.Collector statsCollector = new EncodingStats.Collector();
         private int rowCountIncludingStatic;
         private int tombstoneCount;
@@ -411,6 +413,27 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
             tombstoneCount = 0;
             dataSize = 0;
             cf = ColumnFilter.all(metadata);
+            mutator = trie.mutator(this::mergeIncomingRow,
+                                   this::mergeTombstones,
+                                   this::applyIncomingTombstone,
+                                   this::applyExistingTombstoneToIncomingRow,
+                                   true,
+                                   x -> false);
+        }
+
+        void putInTrie(TableMetadata metadata, ClusteringComparator comparator, InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie, Row untypedRow)
+        throws TrieSpaceExhaustedException
+        {
+            TrieBackedRow row;
+            if (untypedRow instanceof TrieBackedRow)
+                row = (TrieBackedRow) untypedRow;
+            else
+                row = TrieBackedRow.from(metadata, untypedRow);
+
+            Clustering<?> clustering = row.clustering();
+            ByteComparable comparableClustering = comparator.asByteComparable(clustering);
+
+            mutator.apply(row.trie().prefixedBySeparately(comparableClustering, true));
         }
 
         /**
@@ -429,83 +452,24 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
             if (row.isEmpty())
                 return;
 
-            // this assert is expensive, and possibly of limited value; we should consider removing it
-            // or introducing a new class of assertions for test purposes
-            assert (row.isStatic() ? columns().statics : columns().regulars).containsAll(row.columns())
-            : (row.isStatic() ? columns().statics : columns().regulars) + " is not superset of " + row.columns();
-
             try
             {
-                // We do not look for atomicity here, so can do the two steps separately.
-                // TODO: Direct insertion methods (singleton known to not be deleted, deletion known to not delete anything)
-                Clustering<?> clustering = row.clustering();
-                DeletionTime deletionTime = row.deletion().time();
-
-                ByteComparable comparableClustering = metadata.comparator.asByteComparable(clustering);
-                if (!deletionTime.isLive())
-                {
-                    putRowDeletionInTrie(comparableClustering,
-                                         deletionTime);
-                }
-                if (!row.isEmptyAfterDeletion())
-                {
-                    trie.apply(DeletionAwareTrie.<Row, TrieTombstoneMarker>singleton(comparableClustering,
-                                                                                     BYTE_COMPARABLE_VERSION,
-                                                                                     row),
-                               this::mergeIncomingRow,
-                               this::mergeTombstones,
-                               this::applyIncomingTombstone,
-                               this::applyExistingTombstoneToIncomingRow,
-                               true,
-                               x -> false);
-                }
+                putInTrie(metadata, metadata.comparator, trie, row);
             }
             catch (TrieSpaceExhaustedException e)
             {
                 throw new AssertionError(e);
             }
+            // TODO: Improve efficiency of this.
+            // TODO: Update data size and row count.
             Rows.collectStats(row, statsCollector);
-        }
-
-        private void putRowDeletionInTrie(ByteComparable key,
-                                          DeletionTime deletionTime)
-        {
-            try
-            {
-                trie.apply(DeletionAwareTrie.deletionBranch(ByteComparable.EMPTY,
-                                                            BYTE_COMPARABLE_VERSION,
-                                                            RangeTrie.point(key,
-                                                                            BYTE_COMPARABLE_VERSION,
-                                                                            true,
-                                                                            TrieTombstoneMarker.point(deletionTime))),
-                           noConflictInData(),
-                           mergeTombstoneRanges(),
-                           noIncomingSelfDeletion(),
-                           noExistingSelfDeletion(),
-                           true,
-                           x -> false);
-            }
-            catch (TrieSpaceExhaustedException e)
-            {
-                throw new AssertionError(e);
-            }
         }
 
         private void putPartitionDeletionInTrie(DeletionTime deletionTime)
         {
             try
             {
-                trie.apply(DeletionAwareTrie.deletionBranch(ByteComparable.EMPTY,
-                                                            BYTE_COMPARABLE_VERSION,
-                                                            RangeTrie.branch(ByteComparable.EMPTY,
-                                                                             BYTE_COMPARABLE_VERSION,
-                                                                             TrieTombstoneMarker.covering(deletionTime))),
-                           noConflictInData(),
-                           mergeTombstoneRanges(),
-                           noIncomingSelfDeletion(),
-                           noExistingSelfDeletion(),
-                           true,
-                           x -> false);
+                mutator.delete(RangeTrie.branch(ByteComparable.EMPTY, BYTE_COMPARABLE_VERSION, TrieTombstoneMarker.covering(deletionTime)));
             }
             catch (TrieSpaceExhaustedException e)
             {
@@ -517,17 +481,10 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
         {
             try
             {
-                trie.apply(DeletionAwareTrie.deletedRange(ByteComparable.EMPTY,
-                                                          start,
-                                                          end,
-                                                          BYTE_COMPARABLE_VERSION,
-                                                          TrieTombstoneMarker.covering(deletionTime)),
-                           this::mergeIncomingRow,
-                           this::mergeTombstones,
-                           this::applyIncomingTombstone,
-                           this::applyExistingTombstoneToIncomingRow,
-                           true,
-                           x -> false);
+                mutator.delete(RangeTrie.range(start, true,
+                                               end, false,
+                                               BYTE_COMPARABLE_VERSION,
+                                               TrieTombstoneMarker.covering(deletionTime)));
                 statsCollector.update(deletionTime);
             }
             catch (TrieSpaceExhaustedException e)
@@ -581,33 +538,100 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
             return pu;
         }
 
-        RowData mergeIncomingRow(Object existing, Row update)
+        Object mergeIncomingRow(Object existing, Object update)
         {
-            if (existing != null)
+            if (update instanceof Cell)
             {
-                // this is not expected to happen much, so going through toRow and the existing size is okay
-                RowData rowData = (RowData) existing;
-                update = Rows.merge(rowData.toRow(update.clustering(), DeletionTime.LIVE), update);
-                dataSize += update.dataSize() - rowData.dataSize();
+                assert existing == null || existing instanceof Cell;
+                // TODO: update stats
+                Cell<?> updateCell = (Cell<?>) update;
+                Cell<?> existingCell = (Cell<?>) existing;
+                Cell<?> reconciled;
+                if (existingCell == null)
+                {
+                    reconciled = updateCell;
+                    dataSize += reconciled.dataSize();
+                }
+                else
+                {
+                    reconciled = Cells.reconcile(existingCell, updateCell);
+                    if (reconciled != existingCell)
+                        dataSize += reconciled.dataSize() - existingCell.dataSize();
+                }
+                return reconciled;
             }
-            else
+            else if (update == TrieBackedRow.COMPLEX_COLUMN_MARKER)
             {
-                ++rowCountIncludingStatic;
-                dataSize += update.dataSize();
+                assert existing == null || existing == TrieBackedRow.COMPLEX_COLUMN_MARKER;
+                return update;
+            }
+            else if (update instanceof LivenessInfo)
+            {
+                assert existing == null || existing instanceof LivenessInfo;
+                // TODO: update stats
+                LivenessInfo rowUpdate = (LivenessInfo) update;
+                LivenessInfo existingRow = (LivenessInfo) existing;
+                // Note: even though we use LivenessInfo.merge, it returns one of its arguments which is RowData
+                LivenessInfo reconciled;
+
+                if (existingRow == null)
+                {
+                    ++rowCountIncludingStatic;
+                    dataSize += rowUpdate.dataSize();
+                    reconciled = rowUpdate;
+                }
+                else
+                {
+                    reconciled = LivenessInfo.merge(existingRow, rowUpdate);
+                    dataSize = reconciled.dataSize() - existingRow.dataSize();
+                }
+                return reconciled;
+            }
+            else if (update instanceof PartitionMarker)
+            {
+                assert update == PARTITION_MARKER;
+                assert existing == null || existing == PARTITION_MARKER;
+                return PARTITION_MARKER;
             }
 
-            return rowToData(update);
+            throw new AssertionError("Unknown data in trie: " + update);
         }
 
-        private Row applyExistingTombstoneToIncomingRow(TrieTombstoneMarker trieTombstoneMarker, Row o)
+        private Object applyExistingTombstoneToIncomingRow(TrieTombstoneMarker marker, Object o)
         {
-            return o.filter(cf, trieTombstoneMarker.deletionTime(), false, metadata);
+            DeletionTime deletion = marker.deletionTime();
+            if (o instanceof Cell)
+            {
+                Cell<?> cell = (Cell<?>) o;
+                if (!deletion.deletes(cell))
+                    return o;
+                dataSize -= cell.dataSize();
+                return null;
+            }
+            else if (o == TrieBackedRow.COMPLEX_COLUMN_MARKER)
+            {
+                return o;
+            }
+            else if (o instanceof LivenessInfo)
+            {
+                LivenessInfo info = (LivenessInfo) o;
+                if (!deletion.deletes(info))
+                    return o;
+
+                // TODO: How do we check if a row is completely deleted?
+                dataSize -= info.dataSize();
+                return LivenessInfo.EMPTY;
+            }
+            else if (o instanceof PartitionMarker)
+            {
+                return o;
+            }
+            throw new AssertionError("Unknown data in trie: " + o);
         }
 
         private Object applyIncomingTombstone(Object o, TrieTombstoneMarker trieTombstoneMarker)
         {
-            RowData row = (RowData) o;
-            return row.delete(trieTombstoneMarker.deletionTime());
+            return applyExistingTombstoneToIncomingRow(trieTombstoneMarker, o);
         }
 
         private TrieTombstoneMarker mergeTombstones(TrieTombstoneMarker existing, TrieTombstoneMarker update)
@@ -635,7 +659,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
         @Override
         public DeletionTime partitionLevelDeletion()
         {
-            TrieTombstoneMarker applicableRange = trie.deletionOnlyTrie().applicableRange(STATIC_CLUSTERING_PATH);
+            TrieTombstoneMarker applicableRange = trie.deletionOnlyTrie().applicableRange(ByteComparable.EMPTY);
             return applicableRange != null ? applicableRange.deletionTime() : DeletionTime.LIVE;
         }
 

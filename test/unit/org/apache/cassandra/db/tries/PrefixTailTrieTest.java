@@ -82,6 +82,6 @@ public class PrefixTailTrieTest extends PrefixTailTestBase<InMemoryTrie<Object>,
     @Override
     Trie<ByteBuffer> processContent(Trie<Object> trie)
     {
-        return TrieUtil.processContent(trie, x -> x instanceof ByteBuffer ? (ByteBuffer) x : null);
+        return trie.mapValues(x -> x instanceof ByteBuffer ? (ByteBuffer) x : null);
     }
 }

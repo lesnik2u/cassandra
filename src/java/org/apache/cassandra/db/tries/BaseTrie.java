@@ -23,6 +23,8 @@ import java.util.Map;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Predicate;
+
 import org.agrona.DirectBuffer;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 
@@ -44,14 +46,8 @@ public interface BaseTrie<T, C extends Cursor<T>, Q extends BaseTrie<T, C, Q>> e
     /// This enables calls like
     ///     `trie.forEachEntry(x -> System.out.println(x));`
     /// to be mapped directly to a single call to [#process] without extra allocations.
-    interface ValueConsumer<T2> extends Consumer<T2>, Cursor.Walker<T2, Void>
+    interface ValueConsumer<T2> extends Cursor.Walker<T2, Void>
     {
-        @Override
-        default void content(T2 content)
-        {
-            accept(content);
-        }
-
         @Override
         default Void complete()
         {
@@ -281,7 +277,15 @@ public interface BaseTrie<T, C extends Cursor<T>, Q extends BaseTrie<T, C, Q>> e
     /// has no way of presenting such content.)
     Q tailTrie(ByteComparable prefix);
 
+
     /// Returns an entry set containing all tail tree constructed at the points that contain content of
     /// the given type.
-    Iterable<Map.Entry<ByteComparable.Preencoded, Q>> tailTries(Direction direction, Class<? extends T> clazz);
+    default Iterable<Map.Entry<ByteComparable.Preencoded, Q>> tailTries(Direction direction, Class<? extends T> clazz)
+    {
+        return tailTries(direction, clazz::isInstance);
+    }
+
+    /// Returns an entry set containing all tail tree constructed at the points that contain content passing
+    /// the given predicate.
+    Iterable<Map.Entry<ByteComparable.Preencoded, Q>> tailTries(Direction direction, Predicate<? super T> predicate);
 }

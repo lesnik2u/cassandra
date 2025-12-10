@@ -18,6 +18,11 @@
 
 package org.apache.cassandra.db.rows;
 
+import java.util.Collection;
+import java.util.function.Function;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+
 import org.apache.cassandra.cache.IMeasurableMemory;
 import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.DeletionTime;
@@ -60,20 +65,72 @@ public interface TrieTombstoneMarker extends RangeState<TrieTombstoneMarker>, IM
     /// equal) which is not stored or reported.
     TrieTombstoneMarker mergeWith(TrieTombstoneMarker existing);
 
+    /// Combine two markers and return the applicable combined state, obtained by getting the higher of the deletion
+    /// times on both sides of the marker. For boundaries this may result in a covering state (when both sides become
+    /// equal) which is not stored or reported.
+    static TrieTombstoneMarker mergeUpdate(TrieTombstoneMarker existing, @Nonnull TrieTombstoneMarker update)
+    {
+        return update.mergeWith(existing);
+    }
+
+    static TrieTombstoneMarker merge(Collection<TrieTombstoneMarker> markers)
+    {
+        TrieTombstoneMarker acc = null;
+        for (TrieTombstoneMarker marker : markers)
+        {
+            if (acc == null)
+                acc = marker;
+            else
+                acc = acc.mergeWith(marker);
+        }
+        return acc;
+    }
+
+    /// Apply an incoming marker and drop the parts of this marker that do not survive (i.e. supercede) the incoming
+    /// deletion. The result may be null, this, or a partial version of this.
+    @Nullable TrieTombstoneMarker dropShadowed(TrieTombstoneMarker deletion);
+
+    static @Nullable TrieTombstoneMarker dropShadowedUpdate(TrieTombstoneMarker existing, TrieTombstoneMarker deletion)
+    {
+        if (existing == null)
+            return null;
+        else
+            return existing.dropShadowed(deletion);
+    }
+
+    enum PointDataType
+    {
+        ROW,
+        COMPLEX_COLUMN
+    }
+
     /// Returns true if this marker contains a point deletion. The point deletion applies only to the position of the
     /// marker, and it only makes sense for points on the lowest level of the trie hierarchy.
     /// See [TrieTombstoneMarkerImpl.Point] for further details.
-    boolean hasPointData();
+    boolean hasPointData(PointDataType pointDataType);
 
     static TrieTombstoneMarker covering(DeletionTime deletionTime)
     {
         return TrieTombstoneMarkerImpl.covering(deletionTime);
     }
 
-    static TrieTombstoneMarker point(DeletionTime deletionTime)
+    static TrieTombstoneMarker point(PointDataType pointDataType, DeletionTime deletionTime)
     {
-        return TrieTombstoneMarkerImpl.point(deletionTime);
+        return TrieTombstoneMarkerImpl.point(pointDataType, deletionTime);
+    }
+
+    static TrieTombstoneMarker point(PointDataType pointDataType, long deletedAt, int localDeletionTime)
+    {
+        return TrieTombstoneMarkerImpl.point(pointDataType, deletedAt, localDeletionTime);
     }
 
     TrieTombstoneMarker withUpdatedTimestamp(long newTimestamp);
+
+    static @Nullable DeletionTime deletionOfCovering(@Nullable TrieTombstoneMarker marker)
+    {
+        // Covering instances implement DeletionTime.
+        return (DeletionTime) marker;
+    }
+
+    @Nullable TrieTombstoneMarker map(Function<DeletionTime, DeletionTime> mapper);
 }
