@@ -23,6 +23,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
+import com.google.common.base.Predicates;
 import com.google.common.primitives.Ints;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,6 +40,7 @@ import org.apache.cassandra.db.RangeTombstone;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.CellPath;
 import org.apache.cassandra.db.rows.Cells;
 import org.apache.cassandra.db.rows.ColumnData;
 import org.apache.cassandra.db.rows.EncodingStats;
@@ -53,8 +55,10 @@ import org.apache.cassandra.db.tries.DeletionAwareTrie;
 import org.apache.cassandra.db.tries.InMemoryDeletionAwareTrie;
 import org.apache.cassandra.db.tries.RangeTrie;
 import org.apache.cassandra.db.tries.TrieSpaceExhaustedException;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
 
 /**
  * A trie-backed PartitionUpdate. Immutable.
@@ -78,7 +82,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
                                 int rowCountIncludingStatic,
                                 int tombstoneCount,
                                 int dataSize,
-                                DeletionAwareTrie<Object, TrieTombstoneMarker> trie)
+                                InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie)
     {
         super(key, columns, stats, rowCountIncludingStatic, tombstoneCount, trie, metadata);
         this.dataSize = dataSize;
@@ -86,7 +90,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
 
     private static InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> newTrie()
     {
-        InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie = InMemoryDeletionAwareTrie.shortLived(BYTE_COMPARABLE_VERSION);
+        InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie = TrieBackedRow.newTrie();
         try
         {
             trie.putRecursive(ByteComparable.EMPTY, PARTITION_MARKER, noConflictInData());
@@ -245,7 +249,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
     public TriePartitionUpdate withUpdatedTimestamps(long newTimestamp)
     {
 
-        InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> t = InMemoryDeletionAwareTrie.shortLived(BYTE_COMPARABLE_VERSION);
+        InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> t = TrieBackedRow.newTrie();
         try
         {
             t.apply(trie,
@@ -288,7 +292,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
         MutableDeletionInfo.Builder builder = MutableDeletionInfo.builder(partitionLevelDeletion, metadata.comparator, false);
         for (Map.Entry<ByteComparable.Preencoded, TrieTombstoneMarker> entry : trie.deletionOnlyTrie().entrySet())
         {
-            RangeTombstoneMarker marker = entry.getValue().toRangeTombstoneMarker(entry.getKey(), BYTE_COMPARABLE_VERSION, metadata.comparator, partitionLevelDeletion);
+            RangeTombstoneMarker marker = entry.getValue().toRangeTombstoneMarker(entry.getKey(), BYTE_COMPARABLE_VERSION, metadata.comparator);
             if (marker != null)
                 builder.add(marker);
         }
@@ -347,7 +351,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
     {
         long maxTimestamp = LivenessInfo.NO_TIMESTAMP;
         for (Iterator<TrieTombstoneMarker> it = trie.deletionOnlyTrie().valueIterator(); it.hasNext();)
-            maxTimestamp = Math.max(maxTimestamp, it.next().deletionTime().markedForDeleteAt());
+            maxTimestamp = Math.max(maxTimestamp, it.next().rightDeletion().markedForDeleteAt());   // the left deletion is a repeat of some right one; we can just as well skip it
         for (Iterator<Row> it = rowsIncludingStatic(); it.hasNext();)
             maxTimestamp = Math.max(maxTimestamp, Rows.collectMaxTimestamp(it.next()));
 
@@ -375,12 +379,38 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
         return marks;
     }
 
-    private static void addMarksForRow(Row row, List<CounterMark> marks)
+    private void addMarksForRow(Row row, List<CounterMark> marks)
     {
         for (Cell<?> cell : row.cells())
         {
             if (cell.isCounterCell())
-                marks.add(new CounterMark(row, cell.column(), cell.path()));
+                marks.add(new CounterMark(this, row, cell.column(), cell.path()));
+        }
+    }
+
+    @Override
+    public void setCounterMarkValue(Row row, ColumnMetadata column, CellPath path, ByteBuffer value)
+    {
+
+        ByteComparable key = v ->
+            ByteSource.concat(metadata.comparator.asByteComparable(row.clustering()).asComparableBytes(v),
+                              TrieBackedRow.columnKey(columns.columns(row.isStatic()), column),
+                              path != null ? TrieBackedRow.cellPathKey(column, path, v) : ByteSource.EMPTY);
+        try
+        {
+            ((InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>) trie).apply(
+                DeletionAwareTrie.<ByteBuffer, TrieTombstoneMarker>singleton(key, BYTE_COMPARABLE_VERSION, value),
+                (c, v) -> ((Cell) c).withUpdatedValue(v),
+                (x, y) -> x,
+                (x, y) -> x,
+                (x, y) -> y,
+                true,
+                Predicates.alwaysFalse()
+            );
+        }
+        catch (TrieSpaceExhaustedException e)
+        {
+            throw new AssertionError(e);
         }
     }
 
@@ -395,7 +425,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
         private final ColumnFilter cf;
         private final DecoratedKey key;
         private final RegularAndStaticColumns columns;
-        private final InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie = InMemoryDeletionAwareTrie.shortLived(BYTE_COMPARABLE_VERSION);
+        private final InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie = TrieBackedRow.newTrie();
         private final InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>.Mutator<Object, TrieTombstoneMarker> mutator;
         private final EncodingStats.Collector statsCollector = new EncodingStats.Collector();
         private int rowCountIncludingStatic;
@@ -469,7 +499,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
         {
             try
             {
-                mutator.delete(RangeTrie.branch(ByteComparable.EMPTY, BYTE_COMPARABLE_VERSION, TrieTombstoneMarker.covering(deletionTime)));
+                mutator.delete(RangeTrie.branch(ByteComparable.EMPTY, BYTE_COMPARABLE_VERSION, TrieTombstoneMarker.covering(deletionTime, TrieTombstoneMarker.Kind.PARTITION)));
             }
             catch (TrieSpaceExhaustedException e)
             {
@@ -484,7 +514,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
                 mutator.delete(RangeTrie.range(start, true,
                                                end, false,
                                                BYTE_COMPARABLE_VERSION,
-                                               TrieTombstoneMarker.covering(deletionTime)));
+                                               TrieTombstoneMarker.covering(deletionTime, TrieTombstoneMarker.Kind.RANGE)));
                 statsCollector.update(deletionTime);
             }
             catch (TrieSpaceExhaustedException e)
@@ -599,7 +629,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
 
         private Object applyExistingTombstoneToIncomingRow(TrieTombstoneMarker marker, Object o)
         {
-            DeletionTime deletion = marker.deletionTime();
+            DeletionTime deletion = marker.applicableToPointForward();
             if (o instanceof Cell)
             {
                 Cell<?> cell = (Cell<?>) o;
@@ -660,7 +690,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
         public DeletionTime partitionLevelDeletion()
         {
             TrieTombstoneMarker applicableRange = trie.deletionOnlyTrie().applicableRange(ByteComparable.EMPTY);
-            return applicableRange != null ? applicableRange.deletionTime() : DeletionTime.LIVE;
+            return applicableRange != null ? applicableRange.applicableToPointForward() : DeletionTime.LIVE;
         }
 
         @Override

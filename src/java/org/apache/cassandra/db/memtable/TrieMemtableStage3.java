@@ -30,7 +30,6 @@ import com.google.common.annotations.VisibleForTesting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.BufferDecoratedKey;
 import org.apache.cassandra.db.ColumnFamilyStore;
@@ -641,13 +640,7 @@ public class TrieMemtableStage3 extends AbstractAllocatorMemtable
                     long offHeap = data.isEmpty() ? 0 : data.usedSizeOffHeap();
                     try
                     {
-                        data.mutator(updater,
-                                     updater::mergeMarkers,
-                                     updater::applyIncomingMarker,
-                                     updater::applyExistingMarkerToIncomingRow,
-                                     true,
-                                     FORCE_COPY_PARTITION_BOUNDARY)
-                            .apply(TriePartitionUpdateStage3.asMergableTrie(update));
+                        updater.apply(data, TriePartitionUpdateStage3.asMergableTrie(update));
                     }
                     catch (TrieSpaceExhaustedException e)
                     {

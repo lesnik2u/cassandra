@@ -292,9 +292,10 @@ public class TrieBackedPartitionStage3 implements Partition
             }
 
             TrieTombstoneMarker marker = (TrieTombstoneMarker) content;
-            if (marker.hasPointData(TrieTombstoneMarker.PointDataType.ROW))
+            DeletionTime pointDeletion = marker.pointDeletion();
+            if (pointDeletion != null)
                 return BTreeRow.emptyDeletedRow(getClustering(bytes, byteLength),
-                                                Row.Deletion.regular(marker.deletionTime()));
+                                                Row.Deletion.regular(marker.pointDeletion()));
             else
                 return null;
         }
@@ -337,7 +338,7 @@ public class TrieBackedPartitionStage3 implements Partition
             m.delete(RangeTrie.point(comparableClustering,
                                      BYTE_COMPARABLE_VERSION,
                                      true,
-                                     TrieTombstoneMarker.point(TrieTombstoneMarker.PointDataType.ROW, deletionTime)));
+                                     TrieTombstoneMarker.point(deletionTime, TrieTombstoneMarker.Kind.ROW)));
         }
         if (!row.isEmptyAfterDeletion())
             m.apply(DeletionAwareTrie.singleton(comparableClustering, BYTE_COMPARABLE_VERSION, rowToData(row)));
@@ -373,7 +374,7 @@ public class TrieBackedPartitionStage3 implements Partition
         {
             makeMutator(trie).delete(RangeTrie.branch(ByteComparable.EMPTY,
                                                       BYTE_COMPARABLE_VERSION,
-                                                      TrieTombstoneMarker.covering(deletionTime)));
+                                                      TrieTombstoneMarker.covering(deletionTime, TrieTombstoneMarker.Kind.PARTITION)));
         }
         catch (TrieSpaceExhaustedException e)
         {
@@ -391,7 +392,7 @@ public class TrieBackedPartitionStage3 implements Partition
             makeMutator(trie).delete(RangeTrie.range(start, true,
                                                      end, false,
                                                      BYTE_COMPARABLE_VERSION,
-                                                     TrieTombstoneMarker.covering(deletionTime)));
+                                                     TrieTombstoneMarker.covering(deletionTime, TrieTombstoneMarker.Kind.RANGE)));
         }
         catch (TrieSpaceExhaustedException e)
         {
@@ -416,7 +417,7 @@ public class TrieBackedPartitionStage3 implements Partition
         // static row (or a logical position for it if a static row is not defined) gives us the applicable partition
         // deletion.
         TrieTombstoneMarker applicableRange = trie.applicableDeletion(ByteComparable.EMPTY);
-        return applicableRange != null ? applicableRange.deletionTime() : DeletionTime.LIVE;
+        return applicableRange != null ? applicableRange.applicableToPointForward() : DeletionTime.LIVE;
     }
 
     public RegularAndStaticColumns columns()
@@ -500,11 +501,12 @@ public class TrieBackedPartitionStage3 implements Partition
     public Row getRow(Clustering<?> clustering, ByteComparable path)
     {
         RowData data = (RowData) trie.get(path);
-        TrieTombstoneMarker marker = trie.applicableDeletion(path);
+        TrieTombstoneMarker deletionMarker = trie.applicableDeletion(path);
+        DeletionTime deletion = deletionMarker != null ? deletionMarker.applicableToPointForward() : null;
         if (data != null)
-            return data.toRow(clustering, marker != null ? marker.deletionTime() : DeletionTime.LIVE);
-        else if (marker != null)
-            return BTreeRow.emptyDeletedRow(clustering, Row.Deletion.regular(marker.deletionTime()));
+            return data.toRow(clustering, deletion != null ? deletion : DeletionTime.LIVE);
+        else if (deletion != null)
+            return BTreeRow.emptyDeletedRow(clustering, Row.Deletion.regular(deletion));
         else
             return null;
     }
@@ -530,12 +532,13 @@ public class TrieBackedPartitionStage3 implements Partition
             return data;
         // Tombstone boundaries have different clustering positions than rows; the only boundary that can match the
         // position of a row is a point deletion.
-        assert deletion.hasPointData(TrieTombstoneMarker.PointDataType.ROW)
+        DeletionTime delTime = deletion.pointDeletion();
+        assert delTime != null
             : "Deletion tombstone boundary " + deletion + " clashes with row " + data;
 
         // This is a row combined with a point deletion.
         RowData rowData = (RowData) data;
-        return rowData.toRow(Clustering.EMPTY, deletion.deletionTime());
+        return rowData.toRow(Clustering.EMPTY, delTime);
     }
 
     private Clustering<?> getClustering(byte[] bytes, int byteLength)
@@ -597,15 +600,15 @@ public class TrieBackedPartitionStage3 implements Partition
             }
 
             TrieTombstoneMarker marker = (TrieTombstoneMarker) content;
-            if (marker.hasPointData(TrieTombstoneMarker.PointDataType.ROW))
+            DeletionTime pointDeletion = marker.pointDeletion();
+            if (pointDeletion != null)
                 return BTreeRow.emptyDeletedRow(getClustering(bytes, byteLength),
-                                                Row.Deletion.regular(marker.deletionTime()));
+                                                Row.Deletion.regular(pointDeletion));
             else if (byteLength > 0)
                 return ((TrieTombstoneMarker) content).toRangeTombstoneMarker(
                     ByteComparable.preencoded(BYTE_COMPARABLE_VERSION, bytes, 0, byteLength),
                     BYTE_COMPARABLE_VERSION,
-                    metadata.comparator,
-                    partitionLevelDeletion);
+                    metadata.comparator);
             else // partition deletion markers do not need to be presented
                 return null;
         }

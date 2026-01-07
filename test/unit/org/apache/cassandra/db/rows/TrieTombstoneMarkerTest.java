@@ -66,31 +66,35 @@ public class TrieTombstoneMarkerTest
                              (ts, ldt) -> ts == 0 ? DeletionTime.LIVE : new DeletionTime(ts, ldt));
     }
 
+    // TODO: Test level markers
+
     // ========== Covering Marker Tests ==========
 
     @Test
     public void testCoveringCreation()
     {
         DeletionTime dt = new DeletionTime(100, 50);
-        TrieTombstoneMarker marker = TrieTombstoneMarker.covering(dt);
+        TrieTombstoneMarker.Covering marker = TrieTombstoneMarker.covering(dt, TrieTombstoneMarker.Kind.RANGE);
 
         assertNotNull(marker);
         assertFalse(marker.isBoundary());
-        assertFalse(marker.hasPointData(TrieTombstoneMarker.PointDataType.ROW));
-        assertEquals(dt, marker.deletionTime());
+        assertEquals(marker, marker.precedingState(Direction.FORWARD));
+        assertEquals(marker, marker.succedingState(Direction.FORWARD));
+        assertEquals(TrieTombstoneMarker.Kind.RANGE, marker.deletionKind());
+        assertEquals(dt, marker);
     }
 
     @Test
     public void testCoveringIsNotBoundary()
     {
-        TrieTombstoneMarker covering = TrieTombstoneMarker.covering(new DeletionTime(100, 50));
+        TrieTombstoneMarker covering = TrieTombstoneMarker.covering(new DeletionTime(100, 50), TrieTombstoneMarker.Kind.RANGE);
         assertFalse("Covering marker should not be a boundary", covering.isBoundary());
     }
 
     @Test
     public void testCoveringPrecedingState()
     {
-        TrieTombstoneMarker covering = TrieTombstoneMarker.covering(new DeletionTime(100, 50));
+        TrieTombstoneMarker covering = TrieTombstoneMarker.covering(new DeletionTime(100, 50), TrieTombstoneMarker.Kind.RANGE);
         
         // Covering markers return themselves as preceding state in both directions
         assertEquals(covering, covering.precedingState(Direction.FORWARD));
@@ -103,15 +107,14 @@ public class TrieTombstoneMarkerTest
     @Test
     public void testCoveringCannotConvertToRangeTombstoneMarker()
     {
-        TrieTombstoneMarker covering = TrieTombstoneMarker.covering(new DeletionTime(100, 50));
+        TrieTombstoneMarker covering = TrieTombstoneMarker.covering(new DeletionTime(100, 50), TrieTombstoneMarker.Kind.RANGE);
         ClusteringComparator comparator = new ClusteringComparator(Int32Type.instance);
         
         try
         {
             covering.toRangeTombstoneMarker(ByteComparable.EMPTY,
                                            ByteComparable.Version.OSS50,
-                                           comparator,
-                                           DeletionTime.LIVE);
+                                           comparator);
             fail("Covering marker should not be convertible to RangeTombstoneMarker");
         }
         catch (AssertionError e)
@@ -125,8 +128,8 @@ public class TrieTombstoneMarkerTest
     {
         qt().forAll(deletionTimeGen(), deletionTimeGen())
             .checkAssert((dt1, dt2) -> {
-                TrieTombstoneMarker m1 = TrieTombstoneMarker.covering(dt1);
-                TrieTombstoneMarker m2 = TrieTombstoneMarker.covering(dt2);
+                TrieTombstoneMarker m1 = TrieTombstoneMarker.covering(dt1, TrieTombstoneMarker.Kind.RANGE);
+                TrieTombstoneMarker m2 = TrieTombstoneMarker.covering(dt2, TrieTombstoneMarker.Kind.RANGE);
                 
                 TrieTombstoneMarker merged = m1.mergeWith(m2);
                 
@@ -135,7 +138,7 @@ public class TrieTombstoneMarkerTest
                 
                 // Should keep the higher deletion time
                 DeletionTime expected = dt1.supersedes(dt2) ? dt1 : dt2;
-                assertEquals(expected, merged.deletionTime());
+                assertEquals(expected, merged);
             });
     }
 
@@ -144,8 +147,8 @@ public class TrieTombstoneMarkerTest
     {
         qt().forAll(deletionTimeGen(), deletionTimeGen())
             .checkAssert((dt1, dt2) -> {
-                TrieTombstoneMarker marker = TrieTombstoneMarker.covering(dt1);
-                TrieTombstoneMarker deletion = TrieTombstoneMarker.covering(dt2);
+                TrieTombstoneMarker marker = TrieTombstoneMarker.covering(dt1, TrieTombstoneMarker.Kind.RANGE);
+                TrieTombstoneMarker deletion = TrieTombstoneMarker.covering(dt2, TrieTombstoneMarker.Kind.RANGE);
                 
                 TrieTombstoneMarker result = marker.dropShadowed(deletion);
                 
@@ -153,7 +156,7 @@ public class TrieTombstoneMarkerTest
                 {
                     // Marker survives if it supersedes the deletion
                     assertNotNull(result);
-                    assertEquals(dt1, result.deletionTime());
+                    assertEquals(dt1, result);
                 }
                 else
                 {
@@ -171,27 +174,26 @@ public class TrieTombstoneMarkerTest
         DeletionTime left = new DeletionTime(100, 50);
         DeletionTime right = new DeletionTime(200, 60);
         
-        TrieTombstoneMarkerImpl.Covering leftCov = TrieTombstoneMarkerImpl.covering(left);
-        TrieTombstoneMarkerImpl.Covering rightCov = TrieTombstoneMarkerImpl.covering(right);
+        TrieTombstoneMarker.Covering leftCov = TrieTombstoneMarker.covering(left, TrieTombstoneMarker.Kind.RANGE);
+        TrieTombstoneMarker.Covering rightCov = TrieTombstoneMarker.covering(right, TrieTombstoneMarker.Kind.RANGE);
         
-        TrieTombstoneMarker boundary = TrieTombstoneMarkerImpl.make(leftCov, rightCov);
+        TrieTombstoneMarker boundary = TrieTombstoneMarker.make(leftCov, rightCov, null);
         
         assertNotNull(boundary);
         assertTrue(boundary.isBoundary());
-        assertFalse(boundary.hasPointData(TrieTombstoneMarker.PointDataType.ROW));
     }
 
     @Test
     public void testBoundaryWithEqualSidesBecomeCovering()
     {
         DeletionTime dt = new DeletionTime(100, 50);
-        TrieTombstoneMarkerImpl.Covering cov = TrieTombstoneMarkerImpl.covering(dt);
+        TrieTombstoneMarker.Covering cov = TrieTombstoneMarker.covering(dt, TrieTombstoneMarker.Kind.RANGE);
         
-        TrieTombstoneMarker result = TrieTombstoneMarkerImpl.make(cov, cov);
+        TrieTombstoneMarker result = TrieTombstoneMarker.make(cov, cov, null);
         
         assertNotNull(result);
         assertFalse("Equal sides should result in covering marker", result.isBoundary());
-        assertEquals(dt, result.deletionTime());
+        assertEquals(dt, result);
     }
 
     @Test
@@ -200,9 +202,9 @@ public class TrieTombstoneMarkerTest
         DeletionTime left = new DeletionTime(100, 50);
         DeletionTime right = new DeletionTime(200, 60);
         
-        TrieTombstoneMarkerImpl.Covering leftCov = TrieTombstoneMarkerImpl.covering(left);
-        TrieTombstoneMarkerImpl.Covering rightCov = TrieTombstoneMarkerImpl.covering(right);
-        TrieTombstoneMarker boundary = TrieTombstoneMarkerImpl.make(leftCov, rightCov);
+        TrieTombstoneMarker.Covering leftCov = TrieTombstoneMarker.covering(left, TrieTombstoneMarker.Kind.RANGE);
+        TrieTombstoneMarker.Covering rightCov = TrieTombstoneMarker.covering(right, TrieTombstoneMarker.Kind.RANGE);
+        TrieTombstoneMarker boundary = TrieTombstoneMarker.make(leftCov, rightCov, null);
         
         assertEquals(leftCov, boundary.precedingState(Direction.FORWARD));
         assertEquals(rightCov, boundary.precedingState(Direction.REVERSE));
@@ -219,18 +221,22 @@ public class TrieTombstoneMarkerTest
             .assuming((dt1, dt2, dt3, dt4) -> 
                 !dt1.equals(dt2) && !dt3.equals(dt4)) // Ensure we have boundaries
             .checkAssert((dt1, dt2, dt3, dt4) -> {
-                TrieTombstoneMarkerImpl.Covering left1 = dt1.isLive() ? null : TrieTombstoneMarkerImpl.covering(dt1);
-                TrieTombstoneMarkerImpl.Covering right1 = dt2.isLive() ? null : TrieTombstoneMarkerImpl.covering(dt2);
-                TrieTombstoneMarkerImpl.Covering left2 = dt3.isLive() ? null : TrieTombstoneMarkerImpl.covering(dt3);
-                TrieTombstoneMarkerImpl.Covering right2 = dt4.isLive() ? null : TrieTombstoneMarkerImpl.covering(dt4);
+                TrieTombstoneMarker.Covering left1 = dt1.isLive() ? null : TrieTombstoneMarker.covering(dt1, TrieTombstoneMarker.Kind.RANGE);
+                TrieTombstoneMarker.Covering right1 = dt2.isLive() ? null : TrieTombstoneMarker.covering(dt2, TrieTombstoneMarker.Kind.RANGE);
+                TrieTombstoneMarker.Covering left2 = dt3.isLive() ? null : TrieTombstoneMarker.covering(dt3, TrieTombstoneMarker.Kind.RANGE);
+                TrieTombstoneMarker.Covering right2 = dt4.isLive() ? null : TrieTombstoneMarker.covering(dt4, TrieTombstoneMarker.Kind.RANGE);
                 
-                TrieTombstoneMarker b1 = TrieTombstoneMarkerImpl.make(left1, right1);
-                TrieTombstoneMarker b2 = TrieTombstoneMarkerImpl.make(left2, right2);
+                TrieTombstoneMarker b1 = TrieTombstoneMarker.make(left1, right1, null);
+                TrieTombstoneMarker b2 = TrieTombstoneMarker.make(left2, right2, null);
                 
                 TrieTombstoneMarker merged = b1.mergeWith(b2);
                 
                 assertNotNull(merged);
-                // Verify that merge takes the higher deletion on each side
+
+                DeletionTime leftMax = DeletionTime.merge(left1, left2);
+                DeletionTime rightMax = DeletionTime.merge(right1, right2);
+                assertEquals(leftMax, merged.leftDeletion());
+                assertEquals(rightMax, merged.rightDeletion());
             });
     }
 
@@ -240,23 +246,27 @@ public class TrieTombstoneMarkerTest
         DeletionTime left = new DeletionTime(100, 50);
         DeletionTime right = new DeletionTime(200, 60);
         
-        TrieTombstoneMarkerImpl.Covering leftCov = TrieTombstoneMarkerImpl.covering(left);
-        TrieTombstoneMarkerImpl.Covering rightCov = TrieTombstoneMarkerImpl.covering(right);
-        TrieTombstoneMarker boundary = TrieTombstoneMarkerImpl.make(leftCov, rightCov);
+        TrieTombstoneMarker.Covering leftCov = TrieTombstoneMarker.covering(left, TrieTombstoneMarker.Kind.RANGE);
+        TrieTombstoneMarker.Covering rightCov = TrieTombstoneMarker.covering(right, TrieTombstoneMarker.Kind.RANGE);
+        TrieTombstoneMarker boundary = TrieTombstoneMarker.make(leftCov, rightCov, null);
         
         // Restrict to before only
         TrieTombstoneMarker beforeOnly = boundary.restrict(true, false);
         assertNotNull(beforeOnly);
         assertTrue(beforeOnly.isBoundary());
-        
+        assertEquals(leftCov, beforeOnly.leftDeletion());
+        assertEquals(null, beforeOnly.rightDeletion());
+
         // Restrict to after only
         TrieTombstoneMarker afterOnly = boundary.restrict(false, true);
         assertNotNull(afterOnly);
         assertTrue(afterOnly.isBoundary());
-        
+        assertEquals(null, afterOnly.leftDeletion());
+        assertEquals(rightCov, afterOnly.rightDeletion());
+
         // Restrict to both (should return same)
         TrieTombstoneMarker both = boundary.restrict(true, true);
-        assertEquals(boundary, both);
+        assertSame(boundary, both);
         
         // Restrict to neither (should return null)
         TrieTombstoneMarker neither = boundary.restrict(false, false);
@@ -269,12 +279,12 @@ public class TrieTombstoneMarkerTest
     public void testPointCreation()
     {
         DeletionTime pointDt = new DeletionTime(150, 55);
-        TrieTombstoneMarker point = TrieTombstoneMarker.point(TrieTombstoneMarker.PointDataType.ROW, pointDt);
+        TrieTombstoneMarker point = TrieTombstoneMarker.point(pointDt, TrieTombstoneMarker.Kind.ROW);
         
         assertNotNull(point);
         assertTrue(point.isBoundary());
-        assertTrue(point.hasPointData(TrieTombstoneMarker.PointDataType.ROW));
-        assertEquals(pointDt, point.deletionTime());
+        assertEquals(TrieTombstoneMarker.Kind.ROW, point.applicableToPointForward().deletionKind());
+        assertEquals(pointDt, point.applicableToPointForward());
     }
 
     @Test
@@ -283,14 +293,14 @@ public class TrieTombstoneMarkerTest
         DeletionTime pointDt = new DeletionTime(150, 55);
         DeletionTime coveringDt = new DeletionTime(100, 50);
         
-        TrieTombstoneMarkerImpl.Covering pointCov = TrieTombstoneMarkerImpl.covering(pointDt);
-        TrieTombstoneMarkerImpl.Covering coveringCov = TrieTombstoneMarkerImpl.covering(coveringDt);
+        TrieTombstoneMarker.Covering pointCov = TrieTombstoneMarker.covering(pointDt, TrieTombstoneMarker.Kind.ROW);
+        TrieTombstoneMarker.Covering coveringCov = TrieTombstoneMarker.covering(coveringDt, TrieTombstoneMarker.Kind.RANGE);
         
-        TrieTombstoneMarker point = new TrieTombstoneMarkerImpl.Point(pointCov, coveringCov);
+        TrieTombstoneMarker point = new TrieTombstoneMarker.Point(pointCov, coveringCov);
         
         assertNotNull(point);
-        assertTrue(point.hasPointData(TrieTombstoneMarker.PointDataType.ROW));
-        assertEquals(pointDt, point.deletionTime());
+        assertEquals(TrieTombstoneMarker.Kind.ROW, point.applicableToPointForward().deletionKind());
+        assertEquals(pointDt, point.applicableToPointForward());
     }
 
     @Test
@@ -299,18 +309,19 @@ public class TrieTombstoneMarkerTest
         DeletionTime pointDt = new DeletionTime(150, 55);
         DeletionTime coveringDt = new DeletionTime(100, 50);
         
-        TrieTombstoneMarker point = TrieTombstoneMarker.point(TrieTombstoneMarker.PointDataType.ROW, pointDt);
-        TrieTombstoneMarker covering = TrieTombstoneMarker.covering(coveringDt);
+        TrieTombstoneMarker point = TrieTombstoneMarker.point(pointDt, TrieTombstoneMarker.Kind.ROW);
+        TrieTombstoneMarker covering = TrieTombstoneMarker.covering(coveringDt, TrieTombstoneMarker.Kind.RANGE);
         
         TrieTombstoneMarker merged = point.mergeWith(covering);
         
         assertNotNull(merged);
-        assertTrue(merged.hasPointData(TrieTombstoneMarker.PointDataType.ROW));
+        assertEquals(TrieTombstoneMarker.Kind.ROW, merged.applicableToPointForward().deletionKind());
+        assertEquals(pointDt, merged.applicableToPointForward());
         
         // Point should survive if it supersedes covering
         if (pointDt.supersedes(coveringDt))
         {
-            assertEquals(pointDt, merged.deletionTime());
+            assertEquals(pointDt, merged.pointDeletion());
         }
     }
 
@@ -319,17 +330,17 @@ public class TrieTombstoneMarkerTest
     {
         qt().forAll(deletionTimeGen(), deletionTimeGen())
             .checkAssert((dt1, dt2) -> {
-                TrieTombstoneMarker p1 = TrieTombstoneMarker.point(TrieTombstoneMarker.PointDataType.ROW, dt1);
-                TrieTombstoneMarker p2 = TrieTombstoneMarker.point(TrieTombstoneMarker.PointDataType.ROW, dt2);
+                TrieTombstoneMarker p1 = TrieTombstoneMarker.point(dt1, TrieTombstoneMarker.Kind.ROW);
+                TrieTombstoneMarker p2 = TrieTombstoneMarker.point(dt2, TrieTombstoneMarker.Kind.ROW);
                 
                 TrieTombstoneMarker merged = p1.mergeWith(p2);
                 
                 assertNotNull(merged);
-                assertTrue(merged.hasPointData(TrieTombstoneMarker.PointDataType.ROW));
-                
+                assertEquals(TrieTombstoneMarker.Kind.ROW, merged.applicableToPointForward().deletionKind());
+
                 // Should keep the higher deletion time
                 DeletionTime expected = dt1.supersedes(dt2) ? dt1 : dt2;
-                assertEquals(expected, merged.deletionTime());
+                assertEquals(expected, merged.applicableToPointForward());
             });
     }
 
@@ -338,8 +349,8 @@ public class TrieTombstoneMarkerTest
     {
         qt().forAll(deletionTimeGen(), deletionTimeGen())
             .checkAssert((pointDt, deletionDt) -> {
-                TrieTombstoneMarker point = TrieTombstoneMarker.point(TrieTombstoneMarker.PointDataType.ROW, pointDt);
-                TrieTombstoneMarker deletion = TrieTombstoneMarker.covering(deletionDt);
+                TrieTombstoneMarker point = TrieTombstoneMarker.point(pointDt, TrieTombstoneMarker.Kind.ROW);
+                TrieTombstoneMarker deletion = TrieTombstoneMarker.covering(deletionDt, TrieTombstoneMarker.Kind.RANGE);
                 
                 TrieTombstoneMarker result = point.dropShadowed(deletion);
                 
@@ -347,7 +358,8 @@ public class TrieTombstoneMarkerTest
                 {
                     // Point survives if it supersedes the deletion
                     assertNotNull(result);
-                    assertTrue(result.hasPointData(TrieTombstoneMarker.PointDataType.ROW));
+                    assertEquals(TrieTombstoneMarker.Kind.ROW, result.applicableToPointForward().deletionKind());
+                    assertEquals(pointDt, result.applicableToPointForward());
                 }
                 else
                 {
@@ -367,16 +379,16 @@ public class TrieTombstoneMarkerTest
         DeletionTime dt3 = new DeletionTime(150, 55);
         
         List<TrieTombstoneMarker> markers = Arrays.asList(
-            TrieTombstoneMarker.covering(dt1),
-            TrieTombstoneMarker.covering(dt2),
-            TrieTombstoneMarker.covering(dt3)
+            TrieTombstoneMarker.covering(dt1, TrieTombstoneMarker.Kind.RANGE),
+            TrieTombstoneMarker.covering(dt2, TrieTombstoneMarker.Kind.RANGE),
+            TrieTombstoneMarker.covering(dt3, TrieTombstoneMarker.Kind.RANGE)
         );
         
         TrieTombstoneMarker merged = TrieTombstoneMarker.merge(markers);
         
         assertNotNull(merged);
         // Should have the highest deletion time
-        assertEquals(dt2, merged.deletionTime());
+        assertEquals(dt2, merged);
     }
 
     @Test
@@ -392,29 +404,29 @@ public class TrieTombstoneMarkerTest
     public void testCoveringWithUpdatedTimestamp()
     {
         DeletionTime original = new DeletionTime(100, 50);
-        TrieTombstoneMarker marker = TrieTombstoneMarker.covering(original);
+        TrieTombstoneMarker marker = TrieTombstoneMarker.covering(original, TrieTombstoneMarker.Kind.RANGE);
         
         long newTimestamp = 200;
         TrieTombstoneMarker updated = marker.withUpdatedTimestamp(newTimestamp);
         
         assertNotNull(updated);
-        assertEquals(newTimestamp, updated.deletionTime().markedForDeleteAt());
-        assertEquals(original.localDeletionTime(), updated.deletionTime().localDeletionTime());
+        assertEquals(newTimestamp, updated.applicableToPointForward().markedForDeleteAt());
+        assertEquals(original.localDeletionTime(), updated.applicableToPointForward().localDeletionTime());
     }
 
     @Test
     public void testPointWithUpdatedTimestamp()
     {
         DeletionTime pointDt = new DeletionTime(150, 55);
-        TrieTombstoneMarker point = TrieTombstoneMarker.point(TrieTombstoneMarker.PointDataType.ROW, pointDt);
+        TrieTombstoneMarker point = TrieTombstoneMarker.point(pointDt, TrieTombstoneMarker.Kind.ROW);
         
         long newTimestamp = 250;
         TrieTombstoneMarker updated = point.withUpdatedTimestamp(newTimestamp);
         
         if (updated != null)
         {
-            assertEquals(newTimestamp, updated.deletionTime().markedForDeleteAt());
-            assertTrue(updated.hasPointData(TrieTombstoneMarker.PointDataType.ROW));
+            assertEquals(newTimestamp, updated.pointDeletion().markedForDeleteAt());
+            assertEquals(pointDt.localDeletionTime(), updated.pointDeletion().localDeletionTime());
         }
     }
 
@@ -424,20 +436,20 @@ public class TrieTombstoneMarkerTest
     public void testCoveringMap()
     {
         DeletionTime original = new DeletionTime(100, 50);
-        TrieTombstoneMarker marker = TrieTombstoneMarker.covering(original);
+        TrieTombstoneMarker marker = TrieTombstoneMarker.covering(original, TrieTombstoneMarker.Kind.RANGE);
         
         // Map to a higher timestamp
         TrieTombstoneMarker mapped = marker.map(dt -> new DeletionTime(dt.markedForDeleteAt() + 100, dt.localDeletionTime()));
         
         assertNotNull(mapped);
-        assertEquals(200, mapped.deletionTime().markedForDeleteAt());
+        assertEquals(200, mapped.applicableToPointForward().markedForDeleteAt());
     }
 
     @Test
     public void testCoveringMapToLive()
     {
         DeletionTime original = new DeletionTime(100, 50);
-        TrieTombstoneMarker marker = TrieTombstoneMarker.covering(original);
+        TrieTombstoneMarker marker = TrieTombstoneMarker.covering(original, TrieTombstoneMarker.Kind.RANGE);
         
         // Map to LIVE
         TrieTombstoneMarker mapped = marker.map(dt -> DeletionTime.LIVE);
@@ -449,14 +461,15 @@ public class TrieTombstoneMarkerTest
     public void testPointMap()
     {
         DeletionTime pointDt = new DeletionTime(150, 55);
-        TrieTombstoneMarker point = TrieTombstoneMarker.point(TrieTombstoneMarker.PointDataType.ROW, pointDt);
+        TrieTombstoneMarker point = TrieTombstoneMarker.point(pointDt, TrieTombstoneMarker.Kind.ROW);
         
         // Map to a higher timestamp
         TrieTombstoneMarker mapped = point.map(dt -> new DeletionTime(dt.markedForDeleteAt() + 100, dt.localDeletionTime()));
         
         if (mapped != null)
         {
-            assertTrue(mapped.hasPointData(TrieTombstoneMarker.PointDataType.ROW));
+            assertNotNull(mapped.pointDeletion());
+            assertEquals(250, mapped.pointDeletion().markedForDeleteAt());
         }
     }
 
@@ -465,7 +478,7 @@ public class TrieTombstoneMarkerTest
     @Test
     public void testCoveringMemorySize()
     {
-        TrieTombstoneMarker covering = TrieTombstoneMarker.covering(new DeletionTime(100, 50));
+        TrieTombstoneMarker covering = TrieTombstoneMarker.covering(new DeletionTime(100, 50), TrieTombstoneMarker.Kind.RANGE);
         long size = covering.unsharedHeapSize();
         
         assertTrue("Covering marker should have positive heap size", size > 0);
@@ -477,20 +490,21 @@ public class TrieTombstoneMarkerTest
         DeletionTime left = new DeletionTime(100, 50);
         DeletionTime right = new DeletionTime(200, 60);
         
-        TrieTombstoneMarkerImpl.Covering leftCov = TrieTombstoneMarkerImpl.covering(left);
-        TrieTombstoneMarkerImpl.Covering rightCov = TrieTombstoneMarkerImpl.covering(right);
-        TrieTombstoneMarker boundary = TrieTombstoneMarkerImpl.make(leftCov, rightCov);
+        TrieTombstoneMarker.Covering leftCov = TrieTombstoneMarker.covering(left, TrieTombstoneMarker.Kind.RANGE);
+        TrieTombstoneMarker.Covering rightCov = TrieTombstoneMarker.covering(right, TrieTombstoneMarker.Kind.RANGE);
+        TrieTombstoneMarker boundary = TrieTombstoneMarker.make(leftCov, rightCov, null);
         
         long size = boundary.unsharedHeapSize();
         
         assertTrue("Boundary marker should have positive heap size", size > 0);
-        assertTrue("Boundary should be larger than covering", size > TrieTombstoneMarker.covering(left).unsharedHeapSize());
+        assertTrue("Boundary should be larger than covering", size >
+                                                              TrieTombstoneMarker.covering(left, TrieTombstoneMarker.Kind.RANGE).unsharedHeapSize());
     }
 
     @Test
     public void testPointMemorySize()
     {
-        TrieTombstoneMarker point = TrieTombstoneMarker.point(TrieTombstoneMarker.PointDataType.ROW, new DeletionTime(150, 55));
+        TrieTombstoneMarker point = TrieTombstoneMarker.point(new DeletionTime(150, 55), TrieTombstoneMarker.Kind.ROW);
         long size = point.unsharedHeapSize();
         
         assertTrue("Point marker should have positive heap size", size > 0);
@@ -503,14 +517,14 @@ public class TrieTombstoneMarkerTest
     {
         qt().forAll(deletionTimeGen(), deletionTimeGen())
             .checkAssert((dt1, dt2) -> {
-                TrieTombstoneMarker m1 = TrieTombstoneMarker.covering(dt1);
-                TrieTombstoneMarker m2 = TrieTombstoneMarker.covering(dt2);
+                TrieTombstoneMarker m1 = TrieTombstoneMarker.covering(dt1, TrieTombstoneMarker.Kind.RANGE);
+                TrieTombstoneMarker m2 = TrieTombstoneMarker.covering(dt2, TrieTombstoneMarker.Kind.RANGE);
                 
                 TrieTombstoneMarker merged1 = m1.mergeWith(m2);
                 TrieTombstoneMarker merged2 = m2.mergeWith(m1);
                 
                 assertEquals("Merge should be commutative", 
-                           merged1.deletionTime(), merged2.deletionTime());
+                           merged1, merged2);
             });
     }
 
@@ -519,15 +533,15 @@ public class TrieTombstoneMarkerTest
     {
         qt().forAll(deletionTimeGen(), deletionTimeGen(), deletionTimeGen())
             .checkAssert((dt1, dt2, dt3) -> {
-                TrieTombstoneMarker m1 = TrieTombstoneMarker.covering(dt1);
-                TrieTombstoneMarker m2 = TrieTombstoneMarker.covering(dt2);
-                TrieTombstoneMarker m3 = TrieTombstoneMarker.covering(dt3);
+                TrieTombstoneMarker m1 = TrieTombstoneMarker.covering(dt1, TrieTombstoneMarker.Kind.RANGE);
+                TrieTombstoneMarker m2 = TrieTombstoneMarker.covering(dt2, TrieTombstoneMarker.Kind.RANGE);
+                TrieTombstoneMarker m3 = TrieTombstoneMarker.covering(dt3, TrieTombstoneMarker.Kind.RANGE);
                 
                 TrieTombstoneMarker merged1 = m1.mergeWith(m2).mergeWith(m3);
                 TrieTombstoneMarker merged2 = m1.mergeWith(m2.mergeWith(m3));
                 
                 assertEquals("Merge should be associative", 
-                           merged1.deletionTime(), merged2.deletionTime());
+                           merged1, merged2);
             });
     }
 
@@ -536,8 +550,8 @@ public class TrieTombstoneMarkerTest
     {
         qt().forAll(deletionTimeGen(), deletionTimeGen())
             .checkAssert((markerDt, deletionDt) -> {
-                TrieTombstoneMarker marker = TrieTombstoneMarker.covering(markerDt);
-                TrieTombstoneMarker deletion = TrieTombstoneMarker.covering(deletionDt);
+                TrieTombstoneMarker marker = TrieTombstoneMarker.covering(markerDt, TrieTombstoneMarker.Kind.RANGE);
+                TrieTombstoneMarker deletion = TrieTombstoneMarker.covering(deletionDt, TrieTombstoneMarker.Kind.RANGE);
                 
                 TrieTombstoneMarker dropped1 = marker.dropShadowed(deletion);
                 TrieTombstoneMarker dropped2 = dropped1 != null ? dropped1.dropShadowed(deletion) : null;
