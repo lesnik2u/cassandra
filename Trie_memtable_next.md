@@ -99,6 +99,8 @@
 
 - Test `!includeCoveringDeletions`, also add it to tailTrie.
 
+- Make InMemoryRangeTrie cursor's `getNearestContent` directly walk trie nodes (needs directed getFirstChild method).
+
 - Add documentation for TrieMemtable:
     - Structure of the trie, markers
     - Handling of deletion types
@@ -130,8 +132,6 @@
   (This only applies to the race between changing schema and flush completes.)
 
 ### Maybe:
-- Make InMemoryRangeTrie cursor's `getNearestContent` directly walk trie nodes (needs directed getFirstChild method).
-
 - Map value only for intersection
 
 - Implement user-defined handling of combining ascent and descent path content.
