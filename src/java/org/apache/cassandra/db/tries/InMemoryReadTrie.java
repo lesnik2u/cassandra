@@ -686,7 +686,7 @@ public abstract class InMemoryReadTrie<T>
         final InMemoryReadTrie<T> trie;
         int currentNode;
         int currentFullNode;
-        private long currentPosition;
+        protected long currentPosition;
         protected int depth;
         protected T content;
         final Direction direction;
@@ -1254,6 +1254,9 @@ public abstract class InMemoryReadTrie<T>
                 content = null;
                 currentNode = node;
             }
+
+            if (content != null || isLeaf(node))
+                currentPosition |= MAY_HAVE_CONTENT_BIT;
         }
 
         /// Get the content from a prefix node and/or put a backtracking entry for return path data.
@@ -1294,23 +1297,27 @@ public abstract class InMemoryReadTrie<T>
         long descendInto(int child, int transition)
         {
             ++depth;
-            currentPosition = Cursor.encode(depth, transition, direction);
+            long pos = Cursor.encode(depth, transition, direction);
+            currentPosition = pos;
             setCurrentNodeAndApplyPrefixes(child, depth, transition, false);
             return currentPosition;
         }
 
         long descendIntoChain(int child, int transition)
         {
-            return setNodeState(Cursor.encode(++depth, transition, direction), null, child, child);
+            long pos = Cursor.encode(++depth, transition, direction);
+            return setNodeState(pos, null, child, child);
         }
 
         long setNodeState(long nextPosition, T nodeContent, int fullNode, int node)
         {
             currentPosition = nextPosition;
+            if (nodeContent != null || isLeaf(fullNode))
+                currentPosition |= MAY_HAVE_CONTENT_BIT;
             content = nodeContent;
             currentFullNode = fullNode;
             currentNode = node;
-            return nextPosition;
+            return currentPosition;
         }
     }
 

@@ -137,7 +137,12 @@ interface Cursor<T>
     /// Used for sets and ranges to correctly define the range states for branch-inclusive ranges.
     long ON_RETURN_PATH_BIT = 1L << 19;
 
-    /// Mask of the transition bits including the direction. We apply xor with this value to form a position in the
+    /// Mask for the bits used for flags that should not affect position comparison.
+    long FLAGS_MASK = 0xFFFFL;
+
+    /// Flag indicating whether this position may have content.
+    long MAY_HAVE_CONTENT_BIT = 1L;
+
     /// reverse direction.
     long TRANSITION_MASK = 0x8FFL << TRANSITION_SHIFT;
 
@@ -198,8 +203,24 @@ interface Cursor<T>
     static long compare(long encoded1, long encoded2)
     {
         // This can support depth of 2^31 - 1 without overflowing.
-        return encoded1 - encoded2;
+        return (encoded1 & ~FLAGS_MASK) - (encoded2 & ~FLAGS_MASK);
     }
+
+
+    /// Returns a new position with flags from pos2 combined using union operation.
+    /// Union: (pos1 | pos2) & flags | (pos1 & ~flags)
+    static long unionFlags(long pos1, long pos2, long flags)
+    {
+        return (pos1 | pos2) & flags | (pos1 & ~flags);
+    }
+
+    /// Returns a new position with flags from pos2 combined using intersection operation.
+    /// Intersection: pos1 & pos2 & flags | (pos1 & ~flags)
+    static long intersectionFlags(long pos1, long pos2, long flags)
+    {
+        return pos1 & pos2 & flags | (pos1 & ~flags);
+    }
+
 
     static long rootPosition(Direction direction)
     {
@@ -225,7 +246,7 @@ interface Cursor<T>
 
     static boolean isRootPosition(long encodedPosition)
     {
-        return encodedPosition == ROOT_POSITION_FORWARD || encodedPosition == ROOT_POSITION_REVERSE;
+        return compare(encodedPosition, ROOT_POSITION_FORWARD) == 0 || compare(encodedPosition, ROOT_POSITION_REVERSE) == 0;
     }
 
     static long encode(int depth, int transition, Direction direction)
@@ -252,7 +273,7 @@ interface Cursor<T>
     /// returned encoded position is a valid `skipTo` position for the current state.
     static long positionForSkippingBranch(long encodedBranchPosition)
     {
-        return encodedBranchPosition + (1L << TRANSITION_SHIFT);
+        return (encodedBranchPosition & ~FLAGS_MASK) + (1L << TRANSITION_SHIFT);
     }
 
     /// Returns true if the given `currPosition` as returned by `advance`, `advanceMultiple` or `skipTo` is the result
@@ -267,10 +288,11 @@ interface Cursor<T>
 
     static String toString(long encodedPosition)
     {
-        return String.format("depth %d incomingTransition %02x%s %s",
+        return String.format("depth %d incomingTransition %02x%s%s %s",
                              depth(encodedPosition),
                              incomingTransition(encodedPosition),
                              isOnReturnPath(encodedPosition) ? "↑" : " ",
+                             (encodedPosition & MAY_HAVE_CONTENT_BIT) != 0 ? "*" : " ",
                              direction(encodedPosition));
     }
 
@@ -361,9 +383,12 @@ interface Cursor<T>
                 if (isOnReturnPath(currPosition))
                     receiver.onReturnPath();
             }
-            T content = content();
-            if (content != null)
-                return content;
+            if ((currPosition & MAY_HAVE_CONTENT_BIT) != 0)
+            {
+                T content = content();
+                if (content != null)
+                    return content;
+            }
             prevPosition = currPosition;
         }
     }
@@ -406,7 +431,8 @@ interface Cursor<T>
         while (next != ByteSource.END_OF_STREAM)
         {
             long nextPosition = positionForDescentWithByte(position, next);
-            if (compare(skipTo(nextPosition), nextPosition) != 0)
+            long arrived = skipTo(nextPosition);
+            if (compare(arrived, nextPosition) != 0)
                 return false;
             next = bytes.next();
             position = nextPosition;
@@ -463,7 +489,8 @@ interface Cursor<T>
     default <R> R process(Cursor.Walker<? super T, R> walker)
     {
         assertFresh();
-        T content = content();   // handle content on the root node
+        long currentPosition = encodedPosition();
+        T content = (currentPosition & MAY_HAVE_CONTENT_BIT) != 0 ? content() : null;
         if (content == null)
             content = advanceToContent(walker);
 
@@ -487,7 +514,8 @@ interface Cursor<T>
     default <R> R processSkippingBranches(Cursor.Walker<? super T, R> walker)
     {
         assertFresh();
-        T content = content();   // handle content on the root node
+        long currentPosition = encodedPosition();
+        T content = (currentPosition & MAY_HAVE_CONTENT_BIT) != 0 ? content() : null;
         if (content != null)
         {
             walker.content(content);
@@ -504,7 +532,7 @@ interface Cursor<T>
                 break;
             walker.resetPathLength(depth(current) - 1);
             walker.addPathByte(incomingTransition(current));
-            content = content();
+            content = (current & MAY_HAVE_CONTENT_BIT) != 0 ? content() : null;
             if (content == null)
                 content = advanceToContent(walker);
         }
@@ -541,7 +569,7 @@ interface Cursor<T>
         @Override
         public Cursor<T> tailCursor(Direction direction)
         {
-            assert position == Cursor.rootPosition(direction) : "tailTrie called on exhausted cursor";
+            assert compare(position, Cursor.rootPosition(direction)) == 0 : "tailTrie called on exhausted cursor";
             return new Empty<>(direction, byteComparableVersion);
         }
 

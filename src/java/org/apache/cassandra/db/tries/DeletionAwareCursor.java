@@ -87,14 +87,20 @@ public interface DeletionAwareCursor<T, D extends RangeState<D>> extends Cursor<
 
         while (true)
         {
-            T content = content();   // handle content on the root node
-            if (content != null)
-                walker.content(content);
+            // Always check for deletion branches as they are independent of content
             RangeCursor<D> deletionBranch = deletionBranchCursor(direction());
             if (deletionBranch != null && walker.enterDeletionsBranch())
             {
                 processDeletionBranch(walker, deletionBranch);
                 walker.exitDeletionsBranch();
+            }
+            
+            // MAY_HAVE_CONTENT_BIT optimization: only call content() if flag indicates potential content
+            if ((currentPosition & MAY_HAVE_CONTENT_BIT) != 0)
+            {
+                T content = content();
+                if (content != null)
+                    walker.content(content);
             }
 
             long prevPosition = currentPosition;
@@ -113,7 +119,7 @@ public interface DeletionAwareCursor<T, D extends RangeState<D>> extends Cursor<
     private static <D> void processDeletionBranch(DeletionAwareWalker<?, ? super D, ?> walker, Cursor<D> cursor)
     {
         cursor.assertFresh();
-        D content = cursor.content();   // handle content on the root node
+        D content = (cursor.encodedPosition() & MAY_HAVE_CONTENT_BIT) != 0 ? cursor.content() : null;
         if (content == null)
             content = cursor.advanceToContent(walker);
 

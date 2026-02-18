@@ -40,7 +40,7 @@ class RangeIntersectionCursor<S extends RangeState<S>> implements RangeCursor<S>
         this.set = set;
         this.src = src;
         assert Cursor.compare(src.encodedPosition(), set.encodedPosition()) == 0;
-        matchingPosition(set.encodedPosition());
+        matchingPosition(src.encodedPosition());
     }
 
     @Override
@@ -168,7 +168,7 @@ class RangeIntersectionCursor<S extends RangeState<S>> implements RangeCursor<S>
         if (cmp < 0)
             return coveredAreaWithSourceAhead(setPosition);
         if (cmp == 0)
-            return matchingPosition(setPosition);
+            return matchingPosition(sourcePosition);
 
         // Advancing cursor moved beyond the ahead cursor. Check if roles have reversed.
         if (set.precedingIncluded())
@@ -184,7 +184,7 @@ class RangeIntersectionCursor<S extends RangeState<S>> implements RangeCursor<S>
             // Set is ahead of source, but outside the covered area. Skip source to set's position.
             long sourcePosition = src.skipTo(setPosition);
             if (Cursor.compare(sourcePosition, setPosition) == 0)
-                return matchingPosition(setPosition);
+                return matchingPosition(sourcePosition);
             if (src.precedingState() != null)
                 return coveredAreaWithSourceAhead(setPosition);
 
@@ -211,7 +211,7 @@ class RangeIntersectionCursor<S extends RangeState<S>> implements RangeCursor<S>
             // Set is ahead of source, but outside the covered area. Skip source to set's position.
             sourcePosition = src.skipTo(setPosition);
             if (Cursor.compare(setPosition, sourcePosition) == 0)
-                return matchingPosition(setPosition);
+                return matchingPosition(sourcePosition);
             if (src.precedingState() != null)
                 return coveredAreaWithSourceAhead(setPosition);
         }
@@ -245,9 +245,12 @@ class RangeIntersectionCursor<S extends RangeState<S>> implements RangeCursor<S>
     private long setState(State state, long position, S cursorState)
     {
         this.state = state;
-        this.currentPosition = position;
+        if (cursorState != null && cursorState.isBoundary())
+            this.currentPosition = position | MAY_HAVE_CONTENT_BIT;
+        else
+            this.currentPosition = position & ~MAY_HAVE_CONTENT_BIT;
         this.currentState = cursorState;
-        return position;
+        return this.currentPosition;
     }
 
     @Override

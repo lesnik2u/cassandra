@@ -137,6 +137,8 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
         {
             if (!Cursor.isExhausted(position))
             {
+                currentPosition = position | MAY_HAVE_CONTENT_BIT;
+
                 // Always check if we are seeing new content; if we do, that's an easy state update.
                 S content = content();
                 if (content != null)
@@ -271,11 +273,11 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
         InMemoryRangeBranchCursor(InMemoryReadTrie<S> trie, Direction direction, int root, S rootDescentContent, S rootAscentContent)
         {
             super(trie, direction, root);
-            content = rootDescentContent;
             this.rootAscentContent = rootAscentContent;
             if (rootAscentContent != null)
                 addBacktrack(NONE, 0, -1);
-            updateActiveAndReturn(encodedPosition());
+            setNodeState(currentPosition, rootDescentContent, currentFullNode, currentNode);
+            updateActiveAndReturn(currentPosition);
         }
 
         @Override
@@ -299,7 +301,7 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
 
         long presentAscentPathContent()
         {
-            return setNodeState(Cursor.encode(++depth, 0, direction) | ON_RETURN_PATH_BIT,
+            return setNodeState(Cursor.unionFlags(Cursor.encode(++depth, 0, direction), MAY_HAVE_CONTENT_BIT, MAY_HAVE_CONTENT_BIT) | ON_RETURN_PATH_BIT,
                                 rootAscentContent,
                                 NONE,
                                 NONE);

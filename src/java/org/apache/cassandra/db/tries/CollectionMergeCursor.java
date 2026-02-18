@@ -95,6 +95,9 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
     /// The collected content.
     T collectedContent;
 
+    private long currentPosition;
+    private boolean positionCollected;
+
     <I> CollectionMergeCursor(Trie.CollectionMergeResolver<T> resolver, Direction direction, Collection<I> inputs, IntFunction<C[]> cursorArrayConstructor, BiFunction<I, Direction, C> extractor)
     {
         this.resolver = resolver;
@@ -115,6 +118,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         }
 
         // The cursors are all currently positioned on the root and thus in valid heap order.
+        assert Arrays.stream(heap).allMatch(x -> equalCursor(head, x));
     }
 
     /// Interface for internal operations that can be applied to selected top elements of the heap.
@@ -241,14 +245,22 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
     private long maybeSwapHead(long headPosition)
     {
         long heap0Position = heap[0].encodedPosition();
-        if (Cursor.compare(headPosition, heap0Position) <= 0)
+        long cmp = Cursor.compare(headPosition, heap0Position);
+        if (cmp < 0)
+        {
+            currentPosition = headPosition;
+            positionCollected = true;
             return headPosition;   // head is still smallest
+        }
 
-        // otherwise we need to swap heap and heap[0]
-        C newHeap0 = head;
-        head = heap[0];
-        heapifyDown(newHeap0, 0);
-        return heap0Position;
+        if (cmp > 0)
+        {
+            // otherwise we need to swap heap and heap[0]
+            C newHeap0 = head;
+            head = heap[0];
+            heapifyDown(newHeap0, 0);
+        }
+        return encodedPosition();
     }
 
     boolean branchHasMultipleSources()
@@ -265,6 +277,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
     public long advance()
     {
         contentCollected = false;
+        positionCollected = false;
         return doAdvance();
     }
 
@@ -278,6 +291,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
     public long advanceMultiple(TransitionsReceiver receiver)
     {
         contentCollected = false;
+        positionCollected = false;
         // If the current position is present in just one cursor, we can safely descend multiple levels within
         // its branch as no one of the other tries has content for it.
         if (branchHasMultipleSources())
@@ -317,6 +331,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         }
 
         contentCollected = false;
+        positionCollected = false;
         applyToSelectedElementsInHeap(new SkipTo(), 0);
         return maybeSwapHead(head.skipTo(encodedSkipPosition));
     }
@@ -324,7 +339,25 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
     @Override
     public long encodedPosition()
     {
-        return head.encodedPosition();
+        if (!positionCollected)
+        {
+            long pos = head.encodedPosition();
+            if (Cursor.isExhausted(pos) || !branchHasMultipleSources())
+                currentPosition = pos;
+            else
+            {
+                // Returns head's position with flags unioned from all cursors at the same position,
+                // since multiple sources may each contribute flags (e.g. MAY_HAVE_CONTENT_BIT) that
+                // the head alone would not reflect.
+                currentPosition = pos;
+                applyToSelectedElementsInHeap((self, cursor, index) -> {
+                    currentPosition |= cursor.encodedPosition();
+                }, 0);
+                currentPosition = Cursor.unionFlags(pos, currentPosition, Cursor.FLAGS_MASK);
+            }
+            positionCollected = true;
+        }
+        return currentPosition;
     }
 
     @Override

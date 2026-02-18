@@ -201,6 +201,15 @@ abstract class IntersectionCursor<T, C extends Cursor<T>> implements Cursor<T>
                     throw new AssertionError();
             }
         }
+
+        @Override
+        public long encodedPosition()
+        {
+            long pos = super.encodedPosition();
+            if (state == State.MATCHING && !set.state().applicableAfter)
+                pos &= ~Cursor.MAY_HAVE_CONTENT_BIT;
+            return pos;
+        }
     }
 
     /// Intersection cursor for [Trie].

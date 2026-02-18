@@ -37,6 +37,7 @@ abstract class MergeCursor<T, C extends Cursor<T>, U, D extends Cursor<U>, R> im
 
     boolean atC1;
     boolean atC2;
+    long currentPosition;
 
     MergeCursor(C c1, D c2)
     {
@@ -45,6 +46,7 @@ abstract class MergeCursor<T, C extends Cursor<T>, U, D extends Cursor<U>, R> im
         this.c1 = c1;
         this.c2 = c2;
         atC1 = atC2 = true;
+        currentPosition = Cursor.unionFlags(c1.encodedPosition(), c2.encodedPosition(), Cursor.FLAGS_MASK);
     }
 
     @Override
@@ -83,13 +85,16 @@ abstract class MergeCursor<T, C extends Cursor<T>, U, D extends Cursor<U>, R> im
         long cmp = Cursor.compare(c1pos, c2pos);
         atC1 = cmp <= 0;
         atC2 = cmp >= 0;
-        return atC1 ? c1pos : c2pos;
+        if (atC1 && atC2)
+            return currentPosition = Cursor.unionFlags(c1pos, c2pos, Cursor.FLAGS_MASK);
+        else
+            return currentPosition = atC1 ? c1pos : c2pos;
     }
 
     @Override
     public long encodedPosition()
     {
-        return atC1 ? c1.encodedPosition() : c2.encodedPosition();
+        return currentPosition;
     }
 
     @Override

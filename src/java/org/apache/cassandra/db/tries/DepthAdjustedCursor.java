@@ -61,7 +61,6 @@ class DepthAdjustedCursor<T, C extends Cursor<T>> implements Cursor<T>
             return Cursor.rootReturnPosition(adjusted);
         else
             return Cursor.exhaustedPosition(adjusted);
-
     }
 
     @Override

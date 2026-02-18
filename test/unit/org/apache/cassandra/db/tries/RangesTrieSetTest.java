@@ -109,21 +109,28 @@ public class RangesTrieSetTest
                         return cursor.state();
                     }
 
+                    private long applyBit(long pos)
+                    {
+                        if (!Cursor.isExhausted(pos) && content() != null)
+                            pos |= Cursor.MAY_HAVE_CONTENT_BIT;
+                        return pos;
+                    }
+
                     public long encodedPosition()
                     {
-                        return cursor.encodedPosition();
+                        return applyBit(cursor.encodedPosition());
                     }
 
                     @Override
                     public long advance()
                     {
-                        return cursor.advance();
+                        return applyBit(cursor.advance());
                     }
 
                     @Override
                     public long skipTo(long encodedSkipPosition)
                     {
-                        return cursor.skipTo(encodedSkipPosition);
+                        return applyBit(cursor.skipTo(encodedSkipPosition));
                     }
 
                     @Override
@@ -755,10 +762,17 @@ public class RangesTrieSetTest
             return new TrieSetOverRangeCursor(source.tailCursor(direction));
         }
 
+        private long applyBit(long pos)
+        {
+            if (!Cursor.isExhausted(pos) && state() != null)
+                pos |= Cursor.MAY_HAVE_CONTENT_BIT;
+            return pos;
+        }
+
         @Override
         public long encodedPosition()
         {
-            return source.encodedPosition();
+            return applyBit(source.encodedPosition());
         }
 
         @Override
@@ -770,13 +784,13 @@ public class RangesTrieSetTest
         @Override
         public long advance()
         {
-            return source.advance();
+            return applyBit(source.advance());
         }
 
         @Override
         public long skipTo(long encodedSkipPosition)
         {
-            return source.skipTo(encodedSkipPosition);
+            return applyBit(source.skipTo(encodedSkipPosition));
         }
     }
 }

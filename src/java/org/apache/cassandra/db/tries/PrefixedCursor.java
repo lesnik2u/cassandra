@@ -116,7 +116,10 @@ abstract class PrefixedCursor<T, C extends Cursor<T>> extends DepthAdjustedCurso
     private long setPositionAndCheckPrefixDone(long position)
     {
         if (nextPrefixByte == ByteSource.END_OF_STREAM)
+        {
             setAttachmentPoint(position);
+            position = toAdjustedDepth(source.encodedPosition());
+        }
 
         currentPosition = position;
         return position;
@@ -266,7 +269,8 @@ abstract class PrefixedCursor<T, C extends Cursor<T>> extends DepthAdjustedCurso
         @Override
         public RangeCursor<D> deletionBranchCursor(Direction direction)
         {
-            return Cursor.isRootPosition(encodedPosition()) && deletionBranch != null
+            long pos = encodedPosition();
+            return (Cursor.isRootPosition(pos) || Cursor.compare(pos, matchingPositionAtRoot) == 0) && deletionBranch != null
                    ? deletionBranch.tailCursor(direction)
                    : null;
         }
@@ -274,7 +278,8 @@ abstract class PrefixedCursor<T, C extends Cursor<T>> extends DepthAdjustedCurso
         @Override
         public DeletionAwareCursor<T, D> tailCursor(Direction direction)
         {
-            if (Cursor.isRootPosition(encodedPosition()))
+            long pos = encodedPosition();
+            if (Cursor.isRootPosition(pos) || Cursor.compare(pos, matchingPositionAtRoot) == 0)
                 return new DeletionAwareSeparately<>(this, direction);
             else
                 return super.tailCursor(direction);

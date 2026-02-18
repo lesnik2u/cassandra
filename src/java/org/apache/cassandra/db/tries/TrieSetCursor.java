@@ -217,6 +217,7 @@ interface TrieSetCursor extends RangeCursor<TrieSetCursor.RangeState>
     class Negated implements TrieSetCursor
     {
         final TrieSetCursor source;
+        final Direction direction;
 
         enum Overriding
         {
@@ -227,7 +228,14 @@ interface TrieSetCursor extends RangeCursor<TrieSetCursor.RangeState>
         Negated(TrieSetCursor source)
         {
             this.source = source;
+            this.direction = source.direction();
             overriding = Overriding.ROOT;
+        }
+
+        @Override
+        public Direction direction()
+        {
+            return direction;
         }
 
         @Override
@@ -237,12 +245,19 @@ interface TrieSetCursor extends RangeCursor<TrieSetCursor.RangeState>
             switch (overriding)
             {
                 case ROOT_RETURN:
-                    return Cursor.rootReturnPosition(encodedPosition);
+                    return Cursor.rootReturnPosition(encodedPosition) | MAY_HAVE_CONTENT_BIT;
                 case EXHAUSTED:
                     return Cursor.exhaustedPosition(encodedPosition);
                 case ROOT:
                 case NONE:
                 default:
+                    if (!Cursor.isExhausted(encodedPosition))
+                    {
+                        if (state().isBoundary())
+                            encodedPosition |= MAY_HAVE_CONTENT_BIT;
+                        else
+                            encodedPosition &= ~MAY_HAVE_CONTENT_BIT;
+                    }
                     return encodedPosition;
             }
         }
@@ -306,22 +321,22 @@ interface TrieSetCursor extends RangeCursor<TrieSetCursor.RangeState>
             {
                 case ROOT_RETURN:
                     overriding = Overriding.EXHAUSTED;
-                    return encodedPosition();
+                    break;
                 default:
-                    return checkOverride(source.advance());
+                    checkOverride(source.advance());
+                    break;
             }
+            return encodedPosition();
         }
 
         @Override
         public long skipTo(long encodedSkipPosition)
         {
             if (Cursor.isExhausted(encodedSkipPosition) || overriding == Overriding.ROOT_RETURN)
-            {
                 overriding = Overriding.EXHAUSTED;
-                return encodedPosition();
-            }
             else
-                return checkOverride(source.skipTo(encodedSkipPosition));
+                checkOverride(source.skipTo(encodedSkipPosition));
+            return encodedPosition();
         }
 
         // Sets don't implement advanceMultiple as they are only meant to limit data tries.
