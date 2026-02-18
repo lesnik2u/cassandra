@@ -46,7 +46,8 @@ class DepthAdjustedCursor<T, C extends Cursor<T>> implements Cursor<T>
         else if (Cursor.isExhausted(position))
             return position;
         else
-            return matchingPositionAtRoot | (position & Cursor.ON_RETURN_PATH_BIT);
+            // Combine structural bits of matchingPositionAtRoot with return path bit and flags from position.
+            return Cursor.unionFlags(matchingPositionAtRoot, position, Cursor.ON_RETURN_PATH_BIT | Cursor.FLAGS_MASK);
     }
 
     long fromAdjustedDepth(long position)
@@ -57,7 +58,7 @@ class DepthAdjustedCursor<T, C extends Cursor<T>> implements Cursor<T>
             return adjusted;
 
         // The only non-exhausted position that can be requested with this depth is the return path stop for the root.
-        if (position == (matchingPositionAtRoot | Cursor.ON_RETURN_PATH_BIT))
+        if (Cursor.compare(position, matchingPositionAtRoot | Cursor.ON_RETURN_PATH_BIT) == 0)
             return Cursor.rootReturnPosition(adjusted);
         else
             return Cursor.exhaustedPosition(adjusted);

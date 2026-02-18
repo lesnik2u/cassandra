@@ -267,6 +267,15 @@ abstract class PrefixedCursor<T, C extends Cursor<T>> extends DepthAdjustedCurso
         }
 
         @Override
+        public long encodedPosition()
+        {
+            long pos = super.encodedPosition();
+            if ((Cursor.isRootPosition(pos) || Cursor.compare(pos, matchingPositionAtRoot) == 0) && deletionBranch != null)
+                return Cursor.unionFlags(pos, MAY_HAVE_CONTENT_BIT, MAY_HAVE_CONTENT_BIT);
+            return pos;
+        }
+
+        @Override
         public RangeCursor<D> deletionBranchCursor(Direction direction)
         {
             long pos = encodedPosition();
