@@ -61,7 +61,7 @@ abstract class FlexibleMergeCursor<C extends Cursor<?>, D extends Cursor<?>, T> 
         state = c2 != null ? State.AT_BOTH : State.C1_ONLY;
         currentPosition = c1.encodedPosition();
         if (c2 != null)
-            currentPosition = Cursor.unionFlags(currentPosition, c2.encodedPosition(), Cursor.FLAGS_MASK);
+            currentPosition = Cursor.unionFlagsMatchingPositions(currentPosition, c2.encodedPosition());
         // We can't call postAdvance here because the class may not be completely initialized.
         // The concrete class should do that instead
     }
@@ -178,7 +178,7 @@ abstract class FlexibleMergeCursor<C extends Cursor<?>, D extends Cursor<?>, T> 
         }
         // c1pos == c2pos
         state = State.AT_BOTH;
-        currentPosition = Cursor.unionFlags(c1pos, c2pos, Cursor.FLAGS_MASK);
+        currentPosition = Cursor.unionFlagsMatchingPositions(c1pos, c2pos);
         return postAdvance(currentPosition);
     }
 

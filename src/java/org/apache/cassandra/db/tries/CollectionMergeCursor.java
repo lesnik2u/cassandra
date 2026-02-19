@@ -96,7 +96,6 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
     T collectedContent;
 
     private long currentPosition;
-    private boolean positionCollected;
 
     <I> CollectionMergeCursor(Trie.CollectionMergeResolver<T> resolver, Direction direction, Collection<I> inputs, IntFunction<C[]> cursorArrayConstructor, BiFunction<I, Direction, C> extractor)
     {
@@ -117,8 +116,8 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
             ++i;
         }
 
-        // The cursors are all currently positioned on the root and thus in valid heap order.
-        assert Arrays.stream(heap).allMatch(x -> equalCursor(head, x));
+        // Initialize currentPosition since encodedPosition() now returns it directly
+        collectAndCachePosition();
     }
 
     /// Interface for internal operations that can be applied to selected top elements of the heap.
@@ -126,7 +125,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
     {
         void apply(CollectionMergeCursor<T, C> self, C cursor, int index);
 
-        default boolean shouldContinueWithChild(C child, C head)
+        default boolean shouldContinueWithChild(CollectionMergeCursor<T, C> self, C child, C head)
         {
             return equalCursor(child, head);
         }
@@ -203,7 +202,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         if (index >= heap.length)
             return;
         C item = heap[index];
-        if (!action.shouldContinueWithChild(item, head))
+        if (!action.shouldContinueWithChild(this, item, head))
             return;
 
         // If the children are at the same position, they also need advancing and their subheap
@@ -215,6 +214,57 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         // subheaps and combine them on processing the parent.
         action.apply(this, item, index);
     }
+
+    /// Collects and caches the current position by unioning flags from all cursors at the same position.
+    /// This is called after advancing to ensure the position is always up-to-date.
+    private long collectAndCachePosition()
+    {
+        long pos = head.encodedPosition();
+        if (Cursor.isExhausted(pos) || !branchHasMultipleSources())
+        {
+            currentPosition = pos;
+            return currentPosition;
+        }
+
+        // Returns head's position with flags unioned from all cursors at the same position,
+        // since multiple sources may each contribute flags (e.g. MAY_HAVE_CONTENT_BIT) that
+        // the head alone would not reflect.
+
+        // Optimization: if the head already has all flags set, no need to walk the heap
+        if ((pos & Cursor.FLAGS_MASK) == Cursor.FLAGS_MASK)
+        {
+            currentPosition = pos;
+            return currentPosition;
+        }
+
+        currentPosition = pos;
+
+        // Walk the heap to collect flags from all equal cursors, stopping early if all flags are collected
+        applyToSelectedElementsInHeap(FLAG_COLLECTOR, 0);
+
+        // Position bits must match for all selected cursors, so we don't need unionFlags
+        return currentPosition;
+    }
+
+    /// HeapOp to collect flags from heap cursors, with early termination when all flags are collected
+    private static class FlagCollector<T, C extends Cursor<T>> implements HeapOp<T, C>
+    {
+        @Override
+        public void apply(CollectionMergeCursor<T, C> self, C cursor, int index)
+        {
+            self.currentPosition |= cursor.encodedPosition();
+        }
+
+        @Override
+        public boolean shouldContinueWithChild(CollectionMergeCursor<T, C> self, C child, C head)
+        {
+            // Continue only if cursors are equal AND we haven't collected all flags yet
+            return equalCursor(child, head) && (self.currentPosition & Cursor.FLAGS_MASK) != Cursor.FLAGS_MASK;
+        }
+    }
+
+    @SuppressWarnings("rawtypes")
+    private static final HeapOp FLAG_COLLECTOR = new FlagCollector();
 
     /// Push the given state down in the heap from the given index until it finds its proper place among
     /// the subheap rooted at that position.
@@ -249,7 +299,6 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         if (cmp < 0)
         {
             currentPosition = headPosition;
-            positionCollected = true;
             return headPosition;   // head is still smallest
         }
 
@@ -260,7 +309,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
             head = heap[0];
             heapifyDown(newHeap0, 0);
         }
-        return encodedPosition();
+        return collectAndCachePosition();
     }
 
     boolean branchHasMultipleSources()
@@ -277,7 +326,6 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
     public long advance()
     {
         contentCollected = false;
-        positionCollected = false;
         return doAdvance();
     }
 
@@ -291,7 +339,6 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
     public long advanceMultiple(TransitionsReceiver receiver)
     {
         contentCollected = false;
-        positionCollected = false;
         // If the current position is present in just one cursor, we can safely descend multiple levels within
         // its branch as no one of the other tries has content for it.
         if (branchHasMultipleSources())
@@ -311,7 +358,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         class SkipTo implements AdvancingHeapOp<T, C>
         {
             @Override
-            public boolean shouldContinueWithChild(C child, C head)
+            public boolean shouldContinueWithChild(CollectionMergeCursor<T, C> self, C child, C head)
             {
                 // When the requested position descends, the implicit prefix bytes are those of the head cursor,
                 // and thus we need to check against that if it is a match.
@@ -331,7 +378,6 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         }
 
         contentCollected = false;
-        positionCollected = false;
         applyToSelectedElementsInHeap(new SkipTo(), 0);
         return maybeSwapHead(head.skipTo(encodedSkipPosition));
     }
@@ -339,24 +385,6 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
     @Override
     public long encodedPosition()
     {
-        if (!positionCollected)
-        {
-            long pos = head.encodedPosition();
-            if (Cursor.isExhausted(pos) || !branchHasMultipleSources())
-                currentPosition = pos;
-            else
-            {
-                // Returns head's position with flags unioned from all cursors at the same position,
-                // since multiple sources may each contribute flags (e.g. MAY_HAVE_CONTENT_BIT) that
-                // the head alone would not reflect.
-                currentPosition = pos;
-                applyToSelectedElementsInHeap((self, cursor, index) -> {
-                    currentPosition |= cursor.encodedPosition();
-                }, 0);
-                currentPosition = Cursor.unionFlags(pos, currentPosition, Cursor.FLAGS_MASK);
-            }
-            positionCollected = true;
-        }
         return currentPosition;
     }
 

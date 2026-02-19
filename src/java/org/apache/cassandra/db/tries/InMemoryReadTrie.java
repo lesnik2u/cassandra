@@ -1237,16 +1237,22 @@ public abstract class InMemoryReadTrie<T>
                         // There's no reason to delay going to the position of the content.
                         currentPosition |= ON_RETURN_PATH_BIT;
                         content = trie.getContent(node);
+                        currentPosition |= MAY_HAVE_CONTENT_BIT;
                     }
                 }
                 else
+                {
                     content = trie.getContent(node);
+                    currentPosition |= MAY_HAVE_CONTENT_BIT;
+                }
 
                 currentNode = NONE;
             }
             else if (offset(node) == PREFIX_OFFSET)
             {
                 content = processPrefix(node, depth, transition);
+                if (content != null)
+                    currentPosition |= MAY_HAVE_CONTENT_BIT;
                 currentNode = trie.getChildOfPrefixNode(node);
             }
             else
@@ -1254,9 +1260,6 @@ public abstract class InMemoryReadTrie<T>
                 content = null;
                 currentNode = node;
             }
-
-            if (content != null || isLeaf(node))
-                currentPosition |= MAY_HAVE_CONTENT_BIT;
         }
 
         /// Get the content from a prefix node and/or put a backtracking entry for return path data.
@@ -1312,7 +1315,7 @@ public abstract class InMemoryReadTrie<T>
         long setNodeState(long nextPosition, T nodeContent, int fullNode, int node)
         {
             currentPosition = nextPosition;
-            if (nodeContent != null || isLeaf(fullNode))
+            if (nodeContent != null)
                 currentPosition |= MAY_HAVE_CONTENT_BIT;
             content = nodeContent;
             currentFullNode = fullNode;

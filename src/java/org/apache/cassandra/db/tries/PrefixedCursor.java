@@ -118,6 +118,8 @@ abstract class PrefixedCursor<T, C extends Cursor<T>> extends DepthAdjustedCurso
         if (nextPrefixByte == ByteSource.END_OF_STREAM)
         {
             setAttachmentPoint(position);
+            // Replace position with source's adjusted position to inherit its flags (e.g. MAY_HAVE_CONTENT_BIT).
+            // The prefix itself has no content; only the source does.
             position = toAdjustedDepth(source.encodedPosition());
         }
 

@@ -137,10 +137,10 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
         {
             if (!Cursor.isExhausted(position))
             {
-                currentPosition = position | MAY_HAVE_CONTENT_BIT;
+                currentPosition = position;
 
                 // Always check if we are seeing new content; if we do, that's an easy state update.
-                S content = content();
+                S content = (position & MAY_HAVE_CONTENT_BIT) != 0 ? content() : null;
                 if (content != null)
                 {
                     activeRange = content;
@@ -301,7 +301,7 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
 
         long presentAscentPathContent()
         {
-            return setNodeState(Cursor.unionFlags(Cursor.encode(++depth, 0, direction), MAY_HAVE_CONTENT_BIT, MAY_HAVE_CONTENT_BIT) | ON_RETURN_PATH_BIT,
+            return setNodeState(Cursor.encode(++depth, 0, direction) | MAY_HAVE_CONTENT_BIT | ON_RETURN_PATH_BIT,
                                 rootAscentContent,
                                 NONE,
                                 NONE);

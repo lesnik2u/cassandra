@@ -143,6 +143,7 @@ interface Cursor<T>
     /// Flag indicating whether this position may have content.
     long MAY_HAVE_CONTENT_BIT = 1L;
 
+    /// Mask of the transition bits including the direction. We apply xor with this value to form a position in the
     /// reverse direction.
     long TRANSITION_MASK = 0x8FFL << TRANSITION_SHIFT;
 
@@ -209,9 +210,20 @@ interface Cursor<T>
 
     /// Returns a new position with flags from pos2 combined using union operation.
     /// Union: (pos1 | pos2) & flags | (pos1 & ~flags)
+    /// This preserves the structural bits (depth, transition) from pos1 and combines the specified flags from both positions.
     static long unionFlags(long pos1, long pos2, long flags)
     {
         return (pos1 | pos2) & flags | (pos1 & ~flags);
+    }
+
+    /// Returns a new position with flags from pos2 combined using union operation.
+    /// This version is optimized for cases where the position bits (depth and incoming transition) are known to match.
+    /// The assertion validates this invariant in debug builds.
+    static long unionFlagsMatchingPositions(long pos1, long pos2)
+    {
+        assert compare(pos1, pos2) == 0 : 
+            String.format("Position mismatch in unionFlagsMatchingPositions: compare(%016x, %016x) = %d", pos1, pos2, compare(pos1, pos2));
+        return pos1 | pos2;
     }
 
     /// Returns a new position with flags from pos2 combined using intersection operation.
@@ -292,7 +304,7 @@ interface Cursor<T>
                              depth(encodedPosition),
                              incomingTransition(encodedPosition),
                              isOnReturnPath(encodedPosition) ? "↑" : " ",
-                             (encodedPosition & MAY_HAVE_CONTENT_BIT) != 0 ? "*" : " ",
+                             (encodedPosition & MAY_HAVE_CONTENT_BIT) != 0 ? "C" : " ",
                              direction(encodedPosition));
     }
 

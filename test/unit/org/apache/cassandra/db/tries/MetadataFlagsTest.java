@@ -63,7 +63,7 @@ public class MetadataFlagsTest
         Cursor<Integer> c1 = new MockCursor<>(pos | FLAG1);
         Cursor<Integer> c2 = new MockCursor<>(pos | FLAG2);
 
-        MergeCursor<Integer, Cursor<Integer>> merge = new MergeCursor.Plain<>(Trie.throwingResolver(), c1, c2);
+        MergeCursor.Plain<Integer> merge = new MergeCursor.Plain<>(Trie.throwingResolver(), c1, c2);
         
         long expected = pos | FLAG1 | FLAG2;
         assertEquals("MergeCursor should union flags from both sources", expected, merge.encodedPosition());
@@ -314,9 +314,49 @@ public class MetadataFlagsTest
         // Root (depth 0)
         source = new MockCursor<>(Cursor.rootPosition(Direction.FORWARD) | FLAG3);
         adjusted = new DepthAdjustedCursor.Plain<>(source, attachmentPoint);
-        // Should union with attachmentPoint flags
-        long expectedRoot = Cursor.unionFlags(attachmentPoint, source.encodedPosition(), Cursor.ON_RETURN_PATH_BIT | Cursor.FLAGS_MASK);
-        assertEquals("DepthAdjustedCursor should union flags at root", expectedRoot, adjusted.encodedPosition());
+        // Should NOT union with attachmentPoint flags, only preserve source flags
+        long expectedRoot = (attachmentPoint & ~Cursor.FLAGS_MASK) | (source.encodedPosition() & (Cursor.ON_RETURN_PATH_BIT | Cursor.FLAGS_MASK));
+        assertEquals("DepthAdjustedCursor should preserve source flags at root", expectedRoot, adjusted.encodedPosition());
+    }
+
+    @Test
+    public void testUnionFlagsMatchingPositions()
+    {
+        long pos = Cursor.encode(5, 0x41, Direction.FORWARD);
+        long p1 = pos | FLAG1;
+        long p2 = pos | FLAG2;
+
+        long unioned = Cursor.unionFlagsMatchingPositions(p1, p2);
+        assertEquals("Flags should be unioned", pos | FLAG1 | FLAG2, unioned);
+    }
+
+    @Test(expected = AssertionError.class)
+    public void testUnionFlagsMatchingPositionsAssertion()
+    {
+        long p1 = Cursor.encode(5, 0x41, Direction.FORWARD);
+        long p2 = Cursor.encode(5, 0x42, Direction.FORWARD);
+
+        // This should trigger the assertion because positions don't match
+        Cursor.unionFlagsMatchingPositions(p1, p2);
+    }
+
+    @Test
+    public void testCollectionMergeCursorPositionOptimization()
+    {
+        // Test that CollectionMergeCursor correctly unions flags from multiple sources at the same position
+        long pos = Cursor.rootPosition(Direction.FORWARD);
+        List<Cursor<Integer>> inputs = Arrays.asList(
+            new MockCursor<>(pos | FLAG1),
+            new MockCursor<>(pos | FLAG2)
+        );
+
+        CollectionMergeCursor<Integer, Cursor<Integer>> merge = new CollectionMergeCursor.Plain<>(
+            Trie.throwingResolver(), Direction.FORWARD, inputs, Cursor::tailCursor
+        );
+
+        // CollectionMergeCursor.collectAndCachePosition() should have unioned the flags
+        assertEquals("CollectionMergeCursor should union flags from all sources at start", 
+                     pos | FLAG1 | FLAG2, merge.encodedPosition());
     }
 
     @Test
@@ -361,8 +401,8 @@ public class MetadataFlagsTest
         Cursor<Integer> c2 = new MockCursor<>(pos | FLAG2);
         Cursor<Integer> c3 = new MockCursor<>(pos | FLAG3);
 
-        MergeCursor<Integer, Cursor<Integer>> m1 = new MergeCursor.Plain<>(Trie.throwingResolver(), c1, c2);
-        MergeCursor<Integer, Cursor<Integer>> m2 = new MergeCursor.Plain<>(Trie.throwingResolver(), m1, c3);
+        MergeCursor.Plain<Integer> m1 = new MergeCursor.Plain<>(Trie.throwingResolver(), c1, c2);
+        MergeCursor.Plain<Integer> m2 = new MergeCursor.Plain<>(Trie.throwingResolver(), m1, c3);
         
         long expected = pos | FLAG1 | FLAG2 | FLAG3;
         assertEquals("Deep MergeCursor should union flags from all ancestors", expected, m2.encodedPosition());

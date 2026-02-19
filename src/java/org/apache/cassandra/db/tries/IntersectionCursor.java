@@ -203,9 +203,31 @@ abstract class IntersectionCursor<T, C extends Cursor<T>> implements Cursor<T>
         }
 
         @Override
+        public long advance()
+        {
+            return adjustPosition(super.advance());
+        }
+
+        @Override
+        public long advanceMultiple(TransitionsReceiver receiver)
+        {
+            return adjustPosition(super.advanceMultiple(receiver));
+        }
+
+        @Override
+        public long skipTo(long encodedSkipPosition)
+        {
+            return adjustPosition(super.skipTo(encodedSkipPosition));
+        }
+
+        @Override
         public long encodedPosition()
         {
-            long pos = super.encodedPosition();
+            return adjustPosition(super.encodedPosition());
+        }
+
+        private long adjustPosition(long pos)
+        {
             if (state == State.MATCHING && !set.state().applicableAfter)
                 pos &= ~Cursor.MAY_HAVE_CONTENT_BIT;
             return pos;
