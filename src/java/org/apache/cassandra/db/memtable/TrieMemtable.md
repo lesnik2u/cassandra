@@ -12,7 +12,9 @@ representations of all key components:
 - column id
 - cell path
 
-To maintain the correct order, we use the byte-comparable representation of the keys everywhere in tries
+To maintain the correct order, we use the 
+[byte-comparable representation](../../utils/bytecomparable/ByteComparable.md) 
+of the keys everywhere in tries
 and thus will omit "byte-comparable representation" in the text below (in other words, when we say e.g.
 "indexed by the cell path" below we mean "indexed by the byte comparable representation of the cell path").
 
@@ -49,13 +51,11 @@ if a cell is part of a complex column, we don't store the cell path inside the o
 (which is a rare occurence for cells in a memtable), we still use a `Cell` and store it on the live part of
 the trie[^1].
 
-[^1] The main reason for this is the fact that cells can become deleted without any change other than time
+[^1]: The main reason for this is the fact that cells can become deleted without any change other than time
 elapsed, and we will always have the possibility of deleted cells being present in the live branches.
 Because expiration should be very rare for data in memtables, we don't expect the accumulation of this
 kind of tombstones to become a problem. This point is to be revisited when we implement on-disk tries and
 compaction.
-
-TODO: example
 
 ### Complex column
 
@@ -74,7 +74,31 @@ The class `TrieBackedComplexColumn` implements the mapping between a trie branch
 column concept. These complex columns cannot be constructed on their own and are always taken from larger
 trie objects (e.g. a row or a memtable) to represent the column when a legacy consumer needs this form.
 
-TODO: example
+#### Example
+
+The example below shows the trie that describes a complex column of type `map<uuid, double>`, which is
+created with the following insert statement:
+```
+INSERT INTO %s (..., purchases) values (..., {"d79012af-8b34-4fb4-9799-6c0d29ca4e2f" : 88.67,
+                                              "830b82ce-a7f2-4939-9ea1-46b9d3714848" : 168.01})
+```
+```
+-> COMPLEX_COLUMN_MARKER
+*** Start deletion branch
+-> LIVE -> deletedAt=345
+↑ -> deletedAt=345 -> LIVE
+*** End deletion branch
+404830b82cea7f29399ea146b9d371484838 -> [purchases[?]=168.01 ts=346]
+  4d79012af8b34fb497996c0d29ca4e2f38 -> [purchases[?]=88.67 ts=346]
+```
+When we insert a value (rather than update) in a complex column, Cassandra always creates a tombstone with
+a smaller timestamp. Here we see this as a deletion branch which starts a deletion before the root of the
+trie and ends it after the root, covering any data that may have previously existed for the complex column.
+
+On the live side of the trie, we have a `COMPLEX_COLUMN_MARKER` at the root and two trie branches for the
+two entries in the map. The UUID keys are converted to byte-ordered by moving the UUID type digit first
+and are only present in the path in the trie. When we convert these to cells this path would be converted
+back to a UUID.
 
 ### Row
 
@@ -88,7 +112,7 @@ if the row should be listed as live even if all cells that it contains have been
 liveness info as a `LivenessInfo` object at the root of a row and use it as a marker to list rows within
 a partition.
 
-[^2] Provided that the metadata does not change, which we can be guaranteed for the lifetime of a memtable.
+[^2]: Provided that the metadata does not change, which we can be guaranteed for the lifetime of a memtable.
 
 Rows can have a row deletion, which is represented as a branch deletion over the root of the row in the
 deletion branch of the trie. Like complex columns, it is also possible for rows to exist in the deletion
@@ -107,7 +131,44 @@ Rows are implemented by the class `TrieBackedRow`. They can be taken from a bigg
 by inserting cells into a standalone row in a short-lived in-memory trie using a row builder. We use these
 standalone tries as the building blocks to make the partition update objects that we insert into a memtable.
 
-TODO: example
+#### Example
+
+The full row for the example above, where the insert statement also sets the `total` column:
+```
+INSERT INTO %s (..., total, purchases) values (..., 256.68, {"d79012af-8b34-4fb4-9799-6c0d29ca4e2f" : 88.67,
+                                                             "830b82ce-a7f2-4939-9ea1-46b9d3714848" : 168.01})
+```
+is the following:
+```
+-> [ts=346]
+*** Start deletion branch
+-> point deletedAt=345
+01 -> LIVE -> deletedAt=345
+01↑ -> deletedAt=345 -> LIVE
+↑ -> point deletedAt=345
+*** End deletion branch
+00 -> [total=256.68 ts=346]
+01 -> COMPLEX_COLUMN_MARKER
+  404830b82cea7f29399ea146b9d371484838 -> [purchases[?]=168.01 ts=346]
+    4d79012af8b34fb497996c0d29ca4e2f38 -> [purchases[?]=88.67 ts=346]
+```
+
+This trie contains row level markers in both the live (liveness info `[ts=346]`) and deletion
+(`point deletedAt=345`)[^3] branches; a complex column deletion for the column `purchases` with index `01`;
+a cell for the timestamp and value of the simple column `total` with index `00`, and two cells with path
+for the entries of the `purchases` complex column.
+
+[^3]: Note that the deletion marker must be presented both before and after the branch because
+it needs to be returned before the content of the branch in both forward and reverse direction.
+
+When this trie is presented as an iterator of `ColumnData`, `TrieBackedRow` uses `tailTries` to stop on
+cells, deletions and complex column markers and view the trie above as:
+```
+00 -> [total=256.68 ts=346]
+01 -> [complex column]
+```
+where the stop at `01` is given the complex column trie as shown in the example in the previous section as
+the tail trie.
 
 ### Partition
 
@@ -145,13 +206,13 @@ the live and deletion branch and present any data we have together in the tail t
 
 Listing the content of a partition is usually accomplished by taking a so-called "unfiltered" row iterator
 between a set if pairs of clustring bounds, containing all the rows and deletions applicable to that set.
-We perform this by taking the intersection of the partition trie with the set between the bounds[^3],
+We perform this by taking the intersection of the partition trie with the set between the bounds[^4],
 and then walking the combination of the live and deletion trie to find: 
 - row markers (i.e. `LivenessInfo` objects or deletion boundaries with a row marker); when we find one we
   take the tail trie and wrap it into a `TrieBackedRow`, or
 - deletion boundaries, which we map into the corresponding `RangeTombstoneBound(ary)`.
 
-[^3] Inclusivity does not matter for this because clustering bounds do not match row clustering keys; they
+[^4]: Inclusivity does not matter for this because clustering bounds do not match row clustering keys; they
 include a component that adjusts them to be just before or just after a row key.
 
 Note that if a deletion range applies over a wider range than the query, the result of this intersection
@@ -163,7 +224,84 @@ a memtable, or standalone in a short-lived in-memory trie. The most common usage
 write request, it first turns it into one or more `TriePartitionUpdate` objects, and then merges these into
 the current memtable.
 
-TODO: example
+#### Example
+
+The example below is constructed by the following statements:
+```
+INSERT INTO %s (..., date, total, purchases) 
+       VALUES (..., '2026-02-12', 324.83, {"82b4ce57-d6a0-4470-8747-1c2aa4fc5961": 324.83})
+DELETE FROM %s WHERE ... AND date = '2026-02-09'
+DELETE FROM %s WHERE ... AND date <= '2026-01-31' AND date >= '2026-01-01'
+```
+
+```
+-> partition with 1 rows and 8 tombstones
+*** Start deletion branch
+4080004fe620 -> LIVE -> deletedAt=412
+      500460 -> deletedAt=412 -> LIVE
+        0d38 -> point deletedAt=329 and LIVE -> deletedAt=329
+          38↑ -> point deletedAt=329 and deletedAt=329 -> LIVE
+        1038 -> point deletedAt=366
+            01 -> LIVE -> deletedAt=366
+            01↑ -> deletedAt=366 -> LIVE
+          38↑ -> point deletedAt=366
+*** End deletion branch
+408000501038 -> [ts=367]
+            00 -> [total=324.83 ts=367]
+            01 -> COMPLEX_COLUMN_MARKER
+              40482b4ce57d6a047087471c2aa4fc596138 -> [purchases[?]=324.83 ts=367]
+```
+
+The trie here has a partition marker with some collected statistics ("partition with ...") 
+and is first indexed by the row clustering key (the `date` column), which is encoded as an integer
+and wrapped in a clustering sequence container (seen as the `40` leading byte and `38`/`20`/`60` terminators).
+
+Here we have one live row at `408000501038`, including a deletion for its complex column, and two types of
+row deletions: a deleted row at `408000500d38` and a range tombstone between `4080004fe620` and `408000500460`.
+Notice how as we move to the bigger partition container the deletion branches are moved to be split at the
+higher point, repeating the clustering key path &mdash; in the memtable trie all deletion branches split at
+the partition level to be efficiently processed (see 
+[section in Trie.md](../tries/Trie.md#why-predetermined-deletion-levels-deletionsatfixedpoints-are-important)
+for the reasons for this choice).
+
+Live rows are recognized by their `LivenessInfo` marker `[ts=367]`. Deleted rows (partial or not) have a
+marker in the form of a point deletion `point deletedAt=366` and `point deletedAt=329`. Full row deletions
+are applied as a branch deletion covering the row (boundary `LIVE -> deleted` at `408000500d38` and
+`deleted -> LIVE` at `408000500d38↑` (i.e. on the return path, after the children of that point).
+Range tombstones use the clustering bound terminators `20` (before row) and `60` (after row) and are
+expressed as range boundaries to span the trie sections between the two ends[^5].
+
+[^5]: It is possible to express row deletions using these clustering bound terminators as well, having
+the effect of converting the deletion from a `key = X` restriction to `key >= X AND key <= X`. Cassandra
+could just as well work with the latter only; we tried this approach for a while and gave it up for two
+reasons: the existing test suite needs to make a distinction between the two types of deletion; and having
+the start and end at the same point in the trie presents some optimization opportunities.
+
+A `TrieBackedPartition` is usually consumed by converting it to an `UnfilteredRowIterator`. This is
+achieved by calling `tailTries` and recognizing the row and range tombstone markers as described in the
+previous paragraph, viewing the partition as:
+```
+4080004fe620 -> LIVE -> deletedAt=412 (range tombstone start)
+      500460 -> deletedAt=412 -> LIVE (range tombstone end)
+        0d38 -> [row recognized by the marker "point deletedAt=329" with tail]
+        1038 -> [row recognized by the marker "ts=367" with tail]
+```
+where each row is turned into a `TrieBackedRow` by passing in the tail trie originating at that point, and the
+path that leads to the point to be converted to a clustering key object.
+
+For example, the tail given for the `408000501038` row is
+```
+-> [ts=367]
+*** Start deletion branch
+-> point deletedAt=366
+01 -> LIVE -> deletedAt=366
+01↑ -> deletedAt=366 -> LIVE
+↑ -> point deletedAt=366
+*** End deletion branch
+00 -> [total=324.83 ts=367]
+01 -> COMPLEX_COLUMN_MARKER
+  40482b4ce57d6a047087471c2aa4fc596138 -> [purchases[?]=324.83 ts=367]
+```
 
 ### Memtable
 
@@ -186,7 +324,74 @@ which is used to serve reads &mdash; given a key or bounds to query the merge ca
 question of finding the relevant shard that contains the data. Since tries can be read concurrently by
 multiple threads including while they are being modified, we do not need to lock the shard to perform a read.
 
-TODO: example trie
+#### Example
+The trie below
+```
+40a9e72bd32b9f1ba24041434d450038 -> partition with 2 rows and 4 tombstones
+                                *** Start deletion branch
+                                408000500e38 -> deletedAt=345
+                                            01 -> LIVE -> deletedAt=345
+                                            01↑ -> deletedAt=345 -> LIVE
+                                          38↑ -> deletedAt=345
+                                *** End deletion branch
+                                408000500e38 -> [ts=346]
+                                            00 -> [total=256.68 ts=346]
+                                            01 -> COMPLEX_COLUMN_MARKER
+                                              404830b82cea7f29399ea146b9d371484838 -> [purchases[?]=168.01 ts=346]
+                                                4d79012af8b34fb497996c0d29ca4e2f38 -> [purchases[?]=88.67 ts=346]
+                                        1138 -> [ts=385]
+                                            00 -> [total=99.23 ts=385]
+                                            01 -> COMPLEX_COLUMN_MARKER
+                                              404dab4819dc6f5c05b5754a057d78c99a38 -> [purchases[?]=99.23 ts=385]
+  ca8e7ee71a25ce664049424d0038 -> partition with 1 rows and 4 tombstones
+                              *** Start deletion branch
+                              408000500f38 -> deletedAt=351
+                                          01 -> LIVE -> deletedAt=351
+                                          01↑ -> deletedAt=351 -> LIVE
+                                        38↑ -> deletedAt=351
+                              *** End deletion branch
+                              408000500f38 -> [ts=352]
+                                          00 -> [total=542.79 ts=352]
+                                          01 -> COMPLEX_COLUMN_MARKER
+                                            40435441ee93ac90d098e89c75b414addb38 -> [purchases[?]=420.67 ts=352]
+                                                edf143aa8d178f86b4d83a72a7517038 -> [purchases[?]=122.12 ts=352]
+  cd0a37fd8f053c6c404170706c650038 -> partition with 1 rows and 8 tombstones
+                                  *** Start deletion branch
+                                  4080004fe620 -> LIVE -> deletedAt=412
+                                        500460 -> deletedAt=412 -> LIVE
+                                          0d38 -> deletedAt=329 and LIVE -> deletedAt=329
+                                            38↑ -> deletedAt=329 and deletedAt=329 -> LIVE
+                                          1038 -> deletedAt=366
+                                              01 -> LIVE -> deletedAt=366
+                                              01↑ -> deletedAt=366 -> LIVE
+                                            38↑ -> deletedAt=366
+                                  *** End deletion branch
+                                  408000501038 -> [ts=367]
+                                              00 -> [total=324.83 ts=367]
+                                              01 -> COMPLEX_COLUMN_MARKER
+                                                40482b4ce57d6a047087471c2aa4fc596138 -> [purchases[?]=324.83 ts=367]
+```
+is constructed by running the code in `TrieMemtableDocTrieMaker.java` and represents the full trie for a small
+table with three partitions. The leading part of this trie is the decorated partition key, composed of a token
+and serialization of the partition key (the `company` column, containing a string), wrapped in a sequence encoding
+(see [description in ByteComparable.md](../../utils/bytecomparable/ByteComparable.md#multi-component-sequences-partition-or-clustering-keys-tuples-bounds-and-nulls)).
+The first byte `40` starts the sequence encoding, followed by 8 bytes of Murmur3-generated token, another `40` byte
+to start the next value in the sequence, a `00`-terminated string for the company name, and a `38` sequence
+terminator.
+
+At each partition key we have a partition marker that also collects statistics about the partition, and each
+partition is as described in the previous section, with deletion branch splitting at the partition root.
+
+Then the memtable is consumed (e.g. on flush or to list a range of partitions), we once again use `tailTries`
+recognizing these partition markers to view it as:
+```
+40a9e72bd32b9f1ba24041434d450038 -> [partition with tail]
+  ca8e7ee71a25ce664049424d0038 -> [partition with tail]
+  cd0a37fd8f053c6c404170706c650038 -> [partition with tail]
+```
+and we use the tail trie and the path used to reach the point to form a `TrieBackedPartition`. E.g. the example
+trie in the previous section is given as the tail for the key `40cd0a37fd8f053c6c404170706c650038`, which is
+translated to the partition key "Apple".
 
 ## Other key points
 
@@ -283,3 +488,88 @@ Note that when data in the trie and paths are deleted, the trie will drop and re
 them, but cannot do anything about non-trie memory. This means, for example, that cell objects stored in on- or
 off-heap slab buffers cannot be released. This fact is a feature of Cassandra memtables that is not changed by
 the current trie memtable implementations.
+
+#### Example
+
+Suppose we issue a partition deletion for the 'Apple' parition using
+```
+DELETE FROM ... USING TIMESTAMP 513 WHERE company = 'Apple';
+```
+
+This deletion is represented by the partition update
+```
+-> PARTITION_MARKER
+*** Start deletion branch
+-> LIVE -> deletedAt=513
+↑ -> deletedAt=513 -> LIVE
+*** End deletion branch
+```
+
+To merge it into the trie, we attach it at the path corresponding to its decorated partition key: 
+```
+40cd0a37fd8f053c6c404170706c650038 -> PARTITION_MARKER
+                                  *** Start deletion branch
+                                  -> LIVE -> deletedAt=513
+                                  ↑ -> deletedAt=513 -> LIVE
+                                  *** End deletion branch
+```
+and then we call the trie code to merge it in.
+
+The trie code walk this trie in parallel with the in-memory memtable trie. When it reaches the "Apple"
+partition it will see something similar to:
+```
+40cd0a37fd8f053c6c404170706c650038 -> partition with 1 rows and 8 tombstones
+                                  *** Start deletion branch
+                                  -> TO APPLY: LIVE -> deletedAt=513
+                                  4080004fe620 -> LIVE -> deletedAt=412
+                                        500460 -> deletedAt=412 -> LIVE
+                                          0d38 -> deletedAt=329 and LIVE -> deletedAt=329
+                                            38↑ -> deletedAt=329 and deletedAt=329 -> LIVE
+                                          1038 -> deletedAt=366
+                                              01 -> LIVE -> deletedAt=366
+                                              01↑ -> deletedAt=366 -> LIVE
+                                            38↑ -> deletedAt=366
+                                  ↑ -> TO APPLY: deletedAt=513 -> LIVE
+                                  *** End deletion branch
+                                  -> TO APPLY: LIVE -> deletedAt=513
+                                  408000501038 -> [ts=367]
+                                              00 -> [total=324.83 ts=367]
+                                              01 -> COMPLEX_COLUMN_MARKER
+                                                40482b4ce57d6a047087471c2aa4fc596138 -> [purchases[?]=324.83 ts=367]
+                                  ↑ -> TO APPLY: deletedAt=513 -> LIVE
+```
+
+Everything between the "TO APPLY" bounds that has a timestamp smaller than 513 is removed from the trie,
+resulting in:
+```
+40cd0a37fd8f053c6c404170706c650038 -> partition with 1 rows and 2 tombstones
+                                  *** Start deletion branch
+                                  -> LIVE -> deletedAt=513
+                                  ↑ -> deletedAt=513 -> LIVE
+                                  *** End deletion branch
+                                  408000501038 -> [ts=EMPTY]
+                                              01 -> COMPLEX_COLUMN_MARKER
+```
+As part of the process of modifying the in-memory trie, the mutation code recognizes that the `COMPLEX_COLUMN_MARKER`
+has no children and calls the dangling metadata cleaner. As that returns true, the marker and the path leading to
+it is removed.
+```
+40cd0a37fd8f053c6c404170706c650038 -> partition with 1 rows and 2 tombstones
+                                  *** Start deletion branch
+                                  -> LIVE -> deletedAt=513 (to be applied)
+                                  ↑ -> deletedAt=513 -> LIVE (to be applied)
+                                  *** End deletion branch
+                                  408000501038 -> [ts=EMPTY]
+```
+Now `[ts=EMPTY]` (i.e. `LivenessInfo.EMPTY`) has no children and has the dangling metadata cleaner called, which
+tells the trie code to remove it and the path leading to it, resulting in the final
+```
+40cd0a37fd8f053c6c404170706c650038 -> partition with 0 rows and 2 tombstones
+                                  *** Start deletion branch
+                                  -> LIVE -> deletedAt=513 (to be applied)
+                                  ↑ -> deletedAt=513 -> LIVE (to be applied)
+                                  *** End deletion branch
+```
+The intermediate stages shown above are not actually materialized and just given for clarification: the real
+process yields the final state directly by walking the trie in parallel with the deletions and recursively
+setting pointers to null as they are deleted or become empty.

@@ -132,7 +132,8 @@ public class TrieMemtable extends AbstractAllocatorMemtable
 
     /// A merged view of the memtable map. Used for partition range queries and flush.
     /// For efficiency we serve single partition requests off the shard which offers more direct [InMemoryTrie] methods.
-    private final DeletionAwareTrie<Object, TrieTombstoneMarker> mergedTrie;
+    @VisibleForTesting
+    final DeletionAwareTrie<Object, TrieTombstoneMarker> mergedTrie;
 
     @Unmetered
     private final TrieMemtableMetricsView metrics;

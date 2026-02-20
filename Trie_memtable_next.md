@@ -99,16 +99,16 @@
 
 - Test `!includeCoveringDeletions`, also add it to tailTrie.
 
-# TODOs
-
-- Test range prefixes with content at EMPTY.
-
 - Add documentation for TrieMemtable:
     - Structure of the trie, markers
     - Handling of deletion types
     - Handling of cells (deleted or not)
     - Substructure as tail tries
     - etc.
+
+# TODOs
+
+- Test range prefixes with content at EMPTY.
 
 - Test `Mutator.getXXXTailTrie`
 
