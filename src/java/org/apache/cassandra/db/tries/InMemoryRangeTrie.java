@@ -277,6 +277,8 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
             if (rootAscentContent != null)
                 addBacktrack(NONE, 0, -1);
             setNodeState(currentPosition, rootDescentContent, currentFullNode, currentNode);
+            if (rootDescentContent != null)
+                currentPosition |= MAY_HAVE_CONTENT_BIT;
             updateActiveAndReturn(currentPosition);
         }
 

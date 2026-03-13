@@ -204,7 +204,8 @@ interface Cursor<T>
     static long compare(long encoded1, long encoded2)
     {
         // This can support depth of 2^31 - 1 without overflowing.
-        return (encoded1 & ~FLAGS_MASK) - (encoded2 & ~FLAGS_MASK);
+        // Normalise the flag bits to the same value in both operands before subtracting.
+        return (encoded1 | FLAGS_MASK) - (encoded2 | FLAGS_MASK);
     }
 
 

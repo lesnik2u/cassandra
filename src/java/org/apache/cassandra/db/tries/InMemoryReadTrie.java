@@ -1315,8 +1315,6 @@ public abstract class InMemoryReadTrie<T>
         long setNodeState(long nextPosition, T nodeContent, int fullNode, int node)
         {
             currentPosition = nextPosition;
-            if (nodeContent != null)
-                currentPosition |= MAY_HAVE_CONTENT_BIT;
             content = nodeContent;
             currentFullNode = fullNode;
             currentNode = node;

@@ -83,7 +83,9 @@ class SingletonCursor<T> implements Cursor<T>
         currentPosition = nextPosition;
         if (!Cursor.isExhausted(nextPosition))
             prepareNextPosition(currentPosition);
-        return encodedPosition();
+        if (atEnd())
+            currentPosition |= MAY_HAVE_CONTENT_BIT;
+        return currentPosition;
     }
 
     @Override
@@ -106,7 +108,9 @@ class SingletonCursor<T> implements Cursor<T>
         }
         currentPosition = Cursor.positionForDescentWithByte(pos, current);
         nextPosition = Cursor.exhaustedPosition(currentPosition);
-        return encodedPosition();
+        // atEnd() is unconditionally true here; set the bit directly.
+        currentPosition |= MAY_HAVE_CONTENT_BIT;
+        return currentPosition;
     }
 
     @Override

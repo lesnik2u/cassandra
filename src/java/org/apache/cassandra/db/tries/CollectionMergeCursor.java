@@ -117,7 +117,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         }
 
         // Initialize currentPosition since encodedPosition() now returns it directly
-        collectAndCachePosition();
+        collectAndCachePositionFlags();
     }
 
     /// Interface for internal operations that can be applied to selected top elements of the heap.
@@ -217,7 +217,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
 
     /// Collects and caches the current position by unioning flags from all cursors at the same position.
     /// This is called after advancing to ensure the position is always up-to-date.
-    private long collectAndCachePosition()
+    private long collectAndCachePositionFlags()
     {
         long pos = head.encodedPosition();
         if (Cursor.isExhausted(pos) || !branchHasMultipleSources())
@@ -226,12 +226,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
             return currentPosition;
         }
 
-        // Returns head's position with flags unioned from all cursors at the same position,
-        // since multiple sources may each contribute flags (e.g. MAY_HAVE_CONTENT_BIT) that
-        // the head alone would not reflect.
-
-        // Optimization: if the head already has all flags set, no need to walk the heap
-        if ((pos & Cursor.FLAGS_MASK) == Cursor.FLAGS_MASK)
+        if ((pos & Cursor.MAY_HAVE_CONTENT_BIT) == Cursor.MAY_HAVE_CONTENT_BIT)
         {
             currentPosition = pos;
             return currentPosition;
@@ -258,8 +253,8 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         @Override
         public boolean shouldContinueWithChild(CollectionMergeCursor<T, C> self, C child, C head)
         {
-            // Continue only if cursors are equal AND we haven't collected all flags yet
-            return equalCursor(child, head) && (self.currentPosition & Cursor.FLAGS_MASK) != Cursor.FLAGS_MASK;
+            // Continue only if equal AND the content flag is not yet collected.
+            return equalCursor(child, head) && (self.currentPosition & Cursor.MAY_HAVE_CONTENT_BIT) == 0;
         }
     }
 
@@ -309,7 +304,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
             head = heap[0];
             heapifyDown(newHeap0, 0);
         }
-        return collectAndCachePosition();
+        return collectAndCachePositionFlags();
     }
 
     boolean branchHasMultipleSources()
