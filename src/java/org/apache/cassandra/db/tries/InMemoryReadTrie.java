@@ -1432,7 +1432,7 @@ public abstract class InMemoryReadTrie<T>
                 }
             }
 
-            T content = source.content();
+            T content = (source.encodedPosition() & Cursor.MAY_HAVE_CONTENT_BIT) != 0 ? source.content() : null;
             if (content != null)
             {
                 if (type != null)

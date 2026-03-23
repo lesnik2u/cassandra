@@ -284,6 +284,7 @@ extends InMemoryBaseTrie<T> implements DeletionAwareTrie<T, D>
         Mutator<V, E> apply() throws TrieSpaceExhaustedException
         {
             int depth = state.currentDepth;
+            long position = mutationCursor.encodedPosition();
             while (true)
             {
                 if (depth < forcedCopyDepth)
@@ -291,11 +292,10 @@ extends InMemoryBaseTrie<T> implements DeletionAwareTrie<T, D>
 
                 // Content must be applied before descending into the branch to make sure we call the transformers
                 // in the right order.
-                applyContent(mutationCursor.content());
+                applyContent((position & Cursor.MAY_HAVE_CONTENT_BIT) != 0 ? mutationCursor.content() : null);
 
                 int existingAlternateBranch = state.alternateBranch();
                 RangeCursor<E> incomingAlternateBranch = mutationCursor.deletionBranchCursor(Direction.FORWARD);
-                long position;
                 if (incomingAlternateBranch != null || existingAlternateBranch != NONE)
                 {
                     int updatedAlternateBranch = existingAlternateBranch;
@@ -372,7 +372,7 @@ extends InMemoryBaseTrie<T> implements DeletionAwareTrie<T, D>
                 if (depth < forcedCopyDepth)
                     forcedCopyDepth = needsForcedCopy.test(this) ? depth : Integer.MAX_VALUE;
 
-                applyContent(mutationCursor.content());
+                applyContent((position & Cursor.MAY_HAVE_CONTENT_BIT) != 0 ? mutationCursor.content() : null);
                 position = mutationCursor.advance();
                 depth = Cursor.depth(position);
             }

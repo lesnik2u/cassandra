@@ -306,7 +306,7 @@ public class InMemoryTrie<T> extends InMemoryBaseTrie<T> implements Trie<T>
                 if (depth < forcedCopyDepth)
                     forcedCopyDepth = needsForcedCopy.test(this) ? depth : Integer.MAX_VALUE;
 
-                S content = mutationCursor.content();
+                S content = (position & Cursor.MAY_HAVE_CONTENT_BIT) != 0 ? mutationCursor.content() : null;
                 if (content != null)
                     applyDeletionRange(position);
 
@@ -341,7 +341,7 @@ public class InMemoryTrie<T> extends InMemoryBaseTrie<T> implements Trie<T>
                     if (state.currentDepth < forcedCopyDepth)
                         forcedCopyDepth = needsForcedCopy.test(this) ? state.currentDepth : Integer.MAX_VALUE;
 
-                    S mutationContent = mutationCursor.content();
+                    S mutationContent = (position & Cursor.MAY_HAVE_CONTENT_BIT) != 0 ? mutationCursor.content() : null;
 
                     if (mutationContent != null)
                     {

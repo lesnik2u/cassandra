@@ -255,10 +255,7 @@ interface TrieSetCursor extends RangeCursor<TrieSetCursor.RangeState>
                     return currentPosition = Cursor.exhaustedPosition(pos);
                 case ROOT:
                     // In ROOT case, set flag if negated state is a boundary
-                    if (!Cursor.isExhausted(pos) && state().isBoundary())
-                        pos |= MAY_HAVE_CONTENT_BIT;
-                    else
-                        pos &= ~MAY_HAVE_CONTENT_BIT;
+                    pos ^= MAY_HAVE_CONTENT_BIT;
                     return currentPosition = pos;
                 case NONE:
                 default:

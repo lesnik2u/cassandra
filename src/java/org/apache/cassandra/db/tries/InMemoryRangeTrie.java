@@ -140,7 +140,7 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
                 currentPosition = position;
 
                 // Always check if we are seeing new content; if we do, that's an easy state update.
-                S content = (position & MAY_HAVE_CONTENT_BIT) != 0 ? content() : null;
+                S content = this.content;
                 if (content != null)
                 {
                     activeRange = content;
@@ -651,7 +651,7 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
                 if (depth < forcedCopyDepth)
                     forcedCopyDepth = needsForcedCopy.test(this) ? depth : Integer.MAX_VALUE;
 
-                U content = mutationCursor.content();
+                U content = (position & Cursor.MAY_HAVE_CONTENT_BIT) != 0 ? mutationCursor.content() : null;
                 if (content != null)
                 {
                     S existingCoveringState = getExistingCoveringState(Cursor.isOnReturnPath(position));
@@ -704,7 +704,7 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
                     case AT_LIMIT:
                     {
                         // We are following the mutation cursor. Check it for content to apply, and then advance it.
-                        U mutationContent = mutationCursor.content();
+                        U mutationContent = (position & Cursor.MAY_HAVE_CONTENT_BIT) != 0 ? mutationCursor.content() : null;
 
                         int existingContentId = limitOnReturnPath ? state.getAscentPathContentId() : state.descentPathContentId();
                         S existingContent = InMemoryReadTrie.isNull(existingContentId) ? null : state.trie.getContent(existingContentId);
