@@ -215,7 +215,7 @@ public class MetadataFlagsTest
         Cursor<Integer> c1 = new MockCursor<>(pos | FLAG1);
         Cursor<Integer> c2 = new MockCursor<>(pos | FLAG2);
 
-        MappingMergeCursor.Plain<Integer, Integer, Integer> merge = new MappingMergeCursor.Plain<>((x, y) -> x, c1, c2);
+        MergeCursor.PlainMapping<Integer, Integer, Integer> merge = new MergeCursor.PlainMapping<>((x, y) -> x, c1, c2);
         
         long expected = pos | FLAG1 | FLAG2;
         assertEquals("MappingMergeCursor should union flags from both sources", expected, merge.encodedPosition());
