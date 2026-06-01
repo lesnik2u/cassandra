@@ -543,9 +543,12 @@ extends BaseTrie<T, DeletionAwareCursor<T, D>, DeletionAwareTrie<T, D>>
         RangeCursor<D> rc;
         while (true)
         {
-            rc = dac.deletionBranchCursor(Direction.FORWARD);
-            if (rc != null)
-                break;
+            if ((dac.encodedPosition() & Cursor.MAY_HAVE_DELETION_BRANCH_BIT) != 0)
+            {
+                rc = dac.deletionBranchCursor(Direction.FORWARD);
+                if (rc != null)
+                    break;
+            }
             int next = bytes.next();
             if (next == ByteSource.END_OF_STREAM)
                 return null; // no deletion branch found
@@ -653,9 +656,12 @@ extends BaseTrie<T, DeletionAwareCursor<T, D>, DeletionAwareTrie<T, D>>
         ByteSource bytes = prefix.asComparableBytes(c.byteComparableVersion());
         while (true)
         {
-            RangeCursor<D> deletionBranch = c.deletionBranchCursor(Direction.FORWARD);
-            if (deletionBranch != null)
-                return tailTrieSeparately(ByteSource.duplicatable(bytes), c, deletionBranch, includeCoveringDeletions);
+            if ((c.encodedPosition() & Cursor.MAY_HAVE_DELETION_BRANCH_BIT) != 0)
+            {
+                RangeCursor<D> deletionBranch = c.deletionBranchCursor(Direction.FORWARD);
+                if (deletionBranch != null)
+                    return tailTrieSeparately(ByteSource.duplicatable(bytes), c, deletionBranch, includeCoveringDeletions);
+            }
 
             int next = bytes.next();
             long position = c.encodedPosition();

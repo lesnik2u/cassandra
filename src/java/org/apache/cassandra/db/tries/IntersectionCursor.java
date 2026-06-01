@@ -309,6 +309,9 @@ abstract class IntersectionCursor<T, C extends Cursor<T>> implements Cursor<T>
         @Override
         public RangeCursor<D> deletionBranchCursor(Direction direction)
         {
+            if ((source.encodedPosition() & MAY_HAVE_DELETION_BRANCH_BIT) == 0)
+                return null;
+
             RangeCursor<D> deletions = source.deletionBranchCursor(direction);
             if (deletions == null)
                 return null;

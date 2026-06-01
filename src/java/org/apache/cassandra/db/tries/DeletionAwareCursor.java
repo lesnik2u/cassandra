@@ -87,12 +87,14 @@ public interface DeletionAwareCursor<T, D extends RangeState<D>> extends Cursor<
 
         while (true)
         {
-            // Always check for deletion branches as they are independent of content
-            RangeCursor<D> deletionBranch = deletionBranchCursor(direction());
-            if (deletionBranch != null && walker.enterDeletionsBranch())
+            if ((currentPosition & MAY_HAVE_DELETION_BRANCH_BIT) != 0)
             {
-                processDeletionBranch(walker, deletionBranch);
-                walker.exitDeletionsBranch();
+                RangeCursor<D> deletionBranch = deletionBranchCursor(direction());
+                if (deletionBranch != null && walker.enterDeletionsBranch())
+                {
+                    processDeletionBranch(walker, deletionBranch);
+                    walker.exitDeletionsBranch();
+                }
             }
             
             // MAY_HAVE_CONTENT_BIT optimization: only call content() if flag indicates potential content
@@ -177,9 +179,12 @@ public interface DeletionAwareCursor<T, D extends RangeState<D>> extends Cursor<
         {
             if (state == State.C1_ONLY)
             {
-                RangeCursor<D> deletionsBranch = c1.deletionBranchCursor(direction());
-                if (deletionsBranch != null)
-                    addCursor(deletionsBranch);
+                if ((c1.encodedPosition() & MAY_HAVE_DELETION_BRANCH_BIT) != 0)
+                {
+                    RangeCursor<D> deletionsBranch = c1.deletionBranchCursor(direction());
+                    if (deletionsBranch != null)
+                        addCursor(deletionsBranch);
+                }
             }
             return encodedPosition;
         }

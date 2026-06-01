@@ -273,7 +273,7 @@ abstract class PrefixedCursor<T, C extends Cursor<T>> extends DepthAdjustedCurso
         {
             long pos = super.encodedPosition();
             if ((Cursor.isRootPosition(pos) || Cursor.compare(pos, matchingPositionAtRoot) == 0) && deletionBranch != null)
-                return Cursor.unionFlags(pos, MAY_HAVE_CONTENT_BIT, MAY_HAVE_CONTENT_BIT);
+                return Cursor.unionFlags(pos, MAY_HAVE_CONTENT_BIT | MAY_HAVE_DELETION_BRANCH_BIT, MAY_HAVE_CONTENT_BIT | MAY_HAVE_DELETION_BRANCH_BIT);
             return pos;
         }
 

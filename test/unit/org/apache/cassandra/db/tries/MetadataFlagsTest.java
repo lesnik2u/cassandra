@@ -26,6 +26,7 @@ import org.junit.Test;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -407,6 +408,62 @@ public class MetadataFlagsTest
         long expected = pos | FLAG1 | FLAG2 | FLAG3;
         assertEquals("Deep MergeCursor should union flags from all ancestors", expected, m2.encodedPosition());
 
+    }
+
+    @Test
+    public void testCollectionMergeCursorDeletionAwareUnionsFlags()
+    {
+        long pos = Cursor.rootPosition(Direction.FORWARD);
+        List<DeletionAwareCursor<Integer, TrieSetCursor.RangeState>> inputs = Arrays.asList(
+            new MockDeletionAwareCursor<>(pos | Cursor.MAY_HAVE_CONTENT_BIT),
+            new MockDeletionAwareCursor<>(pos | Cursor.MAY_HAVE_DELETION_BRANCH_BIT)
+        );
+
+        CollectionMergeCursor.DeletionAware<Integer, TrieSetCursor.RangeState> merge =
+            new CollectionMergeCursor.DeletionAware<>(
+                contents -> contents.iterator().next(),
+                contents -> contents.iterator().next(),
+                (d, v) -> v,
+                true,
+                Direction.FORWARD,
+                inputs,
+                (c, dir) -> c
+            );
+
+        long expected = pos | Cursor.MAY_HAVE_CONTENT_BIT | Cursor.MAY_HAVE_DELETION_BRANCH_BIT;
+        assertEquals("CollectionMergeCursor.DeletionAware should union both content and deletion branch flags",
+                     expected, merge.encodedPosition());
+    }
+
+    @Test
+    public void testSingletonCursorDeletionBranchFlags()
+    {
+        ByteSource src = ByteSource.of("abc", TrieUtil.VERSION);
+        SingletonCursor.DeletionBranch<Integer, TrieSetCursor.RangeState> cursor =
+            new SingletonCursor.DeletionBranch<>(Direction.FORWARD, src, TrieUtil.VERSION, null);
+
+        // Initially NOT atEnd
+        long startPos = cursor.encodedPosition();
+        assertTrue("Initially it should NOT have MAY_HAVE_DELETION_BRANCH_BIT set",
+                   (startPos & Cursor.MAY_HAVE_DELETION_BRANCH_BIT) == 0);
+
+        // Advance to the end
+        cursor.advance();
+        cursor.advance();
+        cursor.advance();
+        cursor.advance(); // now at end
+        
+        long endPos = cursor.encodedPosition();
+        assertTrue("At end, it should have MAY_HAVE_DELETION_BRANCH_BIT set",
+                   (endPos & Cursor.MAY_HAVE_DELETION_BRANCH_BIT) != 0);
+    }
+
+    private static class MockDeletionAwareCursor<T, D extends RangeState<D>>
+    extends MockCursor<T> implements DeletionAwareCursor<T, D>
+    {
+        MockDeletionAwareCursor(long position) { super(position); }
+        @Override public RangeCursor<D> deletionBranchCursor(Direction direction) { return null; }
+        @Override public DeletionAwareCursor<T, D> tailCursor(Direction direction) { return this; }
     }
 
     private static class MockCursor<T> implements Cursor<T>

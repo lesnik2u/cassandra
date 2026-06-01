@@ -126,6 +126,15 @@ extends InMemoryBaseTrie<T> implements DeletionAwareTrie<T, D>
         }
 
         @Override
+        T processPrefix(int node, int depth, int transition)
+        {
+            T content = super.processPrefix(node, depth, transition);
+            if (trie.getAlternateBranch(node) != NONE)
+                currentPosition |= MAY_HAVE_DELETION_BRANCH_BIT;
+            return content;
+        }
+
+        @Override
         public RangeCursor<D> deletionBranchCursor(Direction direction)
         {
             int alternateBranch = trie.getAlternateBranch(currentFullNode);
@@ -295,7 +304,9 @@ extends InMemoryBaseTrie<T> implements DeletionAwareTrie<T, D>
                 applyContent((position & Cursor.MAY_HAVE_CONTENT_BIT) != 0 ? mutationCursor.content() : null);
 
                 int existingAlternateBranch = state.alternateBranch();
-                RangeCursor<E> incomingAlternateBranch = mutationCursor.deletionBranchCursor(Direction.FORWARD);
+                RangeCursor<E> incomingAlternateBranch = (position & Cursor.MAY_HAVE_DELETION_BRANCH_BIT) != 0
+                                                         ? mutationCursor.deletionBranchCursor(Direction.FORWARD)
+                                                         : null;
                 if (incomingAlternateBranch != null || existingAlternateBranch != NONE)
                 {
                     int updatedAlternateBranch = existingAlternateBranch;

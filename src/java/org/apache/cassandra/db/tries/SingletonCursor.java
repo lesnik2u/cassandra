@@ -220,6 +220,24 @@ class SingletonCursor<T> implements Cursor<T>
         }
 
         @Override
+        public long encodedPosition()
+        {
+            long pos = super.encodedPosition();
+            if (atEnd())
+                pos |= MAY_HAVE_DELETION_BRANCH_BIT;
+            return pos;
+        }
+
+        @Override
+        public long advanceMultiple(TransitionsReceiver receiver)
+        {
+            long pos = super.advanceMultiple(receiver);
+            if (atEnd())
+                pos |= MAY_HAVE_DELETION_BRANCH_BIT;
+            return pos;
+        }
+
+        @Override
         public RangeCursor<D> deletionBranchCursor(Direction direction)
         {
             return atEnd() ? deletionBranch.cursor(direction) : null;

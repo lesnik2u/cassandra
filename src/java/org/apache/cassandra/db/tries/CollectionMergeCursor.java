@@ -19,7 +19,6 @@
 package org.apache.cassandra.db.tries;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.function.BiFunction;
@@ -215,18 +214,24 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         action.apply(this, item, index);
     }
 
+    long collectFlagsMask()
+    {
+        return Cursor.MAY_HAVE_CONTENT_BIT;
+    }
+
     /// Collects and caches the current position by unioning flags from all cursors at the same position.
     /// This is called after advancing to ensure the position is always up-to-date.
     private long collectAndCachePositionFlags()
     {
         long pos = head.encodedPosition();
+        long mask = collectFlagsMask();
         if (Cursor.isExhausted(pos) || !branchHasMultipleSources())
         {
             currentPosition = pos;
             return currentPosition;
         }
 
-        if ((pos & Cursor.MAY_HAVE_CONTENT_BIT) == Cursor.MAY_HAVE_CONTENT_BIT)
+        if ((pos & mask) == mask)
         {
             currentPosition = pos;
             return currentPosition;
@@ -253,8 +258,9 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         @Override
         public boolean shouldContinueWithChild(CollectionMergeCursor<T, C> self, C child, C head)
         {
-            // Continue only if equal AND the content flag is not yet collected.
-            return equalCursor(child, head) && (self.currentPosition & Cursor.MAY_HAVE_CONTENT_BIT) == 0;
+            long mask = self.collectFlagsMask();
+            // Continue only if equal AND at least one flag in the mask is not yet collected in self.currentPosition.
+            return equalCursor(child, head) && (self.currentPosition & mask) != mask;
         }
     }
 
@@ -556,6 +562,12 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         /// partition roots), we can use this optimization.
         final boolean deletionsAtFixedPoints;
 
+        @Override
+        long collectFlagsMask()
+        {
+            return Cursor.MAY_HAVE_CONTENT_BIT | Cursor.MAY_HAVE_DELETION_BRANCH_BIT;
+        }
+
         RangeCursor<D> relevantDeletions;
         int deletionBranchDepth = -1;
 
@@ -709,9 +721,12 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         /// deletion branches must be presented at shared positions.
         void addDeletionTrieBranchFixedPoints(DeletionAwareCursor<T,D> cursor)
         {
-            RangeCursor<D> deletionsBranch = cursor.deletionBranchCursor(direction);
-            if (deletionsBranch != null)
-                collectedDeletionBranches.add(deletionsBranch);
+            if ((cursor.encodedPosition() & Cursor.MAY_HAVE_DELETION_BRANCH_BIT) != 0)
+            {
+                RangeCursor<D> deletionsBranch = cursor.deletionBranchCursor(direction);
+                if (deletionsBranch != null)
+                    collectedDeletionBranches.add(deletionsBranch);
+            }
             // Otherwise there is no need to track the subtrie. If there are deletions, they must be presented here.
         }
 
@@ -736,11 +751,16 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         /// substructure.
         void addDeletionTrieBranchNoFixedPoints(DeletionAwareCursor<T,D> cursor)
         {
-            RangeCursor<D> deletionsBranch = cursor.deletionBranchCursor(direction);
-            if (deletionsBranch != null)
-                collectedDeletionBranches.add(deletionsBranch);
-            else
-                sourcesWithNoDeletionBranch.add(cursor);
+            if ((cursor.encodedPosition() & Cursor.MAY_HAVE_DELETION_BRANCH_BIT) != 0)
+            {
+                RangeCursor<D> deletionsBranch = cursor.deletionBranchCursor(direction);
+                if (deletionsBranch != null)
+                {
+                    collectedDeletionBranches.add(deletionsBranch);
+                    return;
+                }
+            }
+            sourcesWithNoDeletionBranch.add(cursor);
         }
 
         private RangeCursor<D> cursorForCollectedDeletionBranches()

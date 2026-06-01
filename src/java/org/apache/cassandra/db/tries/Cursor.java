@@ -143,6 +143,9 @@ interface Cursor<T>
     /// Flag indicating whether this position may have content.
     long MAY_HAVE_CONTENT_BIT = 1L;
 
+    /// Flag indicating whether this position may have deletion branch.
+    long MAY_HAVE_DELETION_BRANCH_BIT = 2L;
+
     /// Mask of the transition bits including the direction. We apply xor with this value to form a position in the
     /// reverse direction.
     long TRANSITION_MASK = 0x8FFL << TRANSITION_SHIFT;
@@ -301,11 +304,12 @@ interface Cursor<T>
 
     static String toString(long encodedPosition)
     {
-        return String.format("depth %d incomingTransition %02x%s%s %s",
+        return String.format("depth %d incomingTransition %02x%s%s%s %s",
                              depth(encodedPosition),
                              incomingTransition(encodedPosition),
                              isOnReturnPath(encodedPosition) ? "↑" : " ",
                              (encodedPosition & MAY_HAVE_CONTENT_BIT) != 0 ? "C" : " ",
+                             (encodedPosition & MAY_HAVE_DELETION_BRANCH_BIT) != 0 ? "D" : " ",
                              direction(encodedPosition));
     }
 
