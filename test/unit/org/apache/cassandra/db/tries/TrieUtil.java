@@ -884,6 +884,11 @@ public class TrieUtil
 
     static class IntegerSerDe implements FileWriter.DataSerializer<Integer>, OnDiskCursor.DataDeserializer<Integer>
     {
+        @Override
+        public int serializedSize(Integer value)
+        {
+            return 4;
+        }
 
         @Override
         public int serialize(DataOutputPlus out, Integer value) throws IOException
@@ -902,6 +907,11 @@ public class TrieUtil
 
     static class StringSerDe implements FileWriter.DataSerializer<String>, OnDiskCursor.DataDeserializer<String>
     {
+        @Override
+        public int serializedSize(String value)
+        {
+            return value.getBytes(StandardCharsets.UTF_8).length;
+        }
 
         @Override
         public int serialize(DataOutputPlus out, String value) throws IOException
