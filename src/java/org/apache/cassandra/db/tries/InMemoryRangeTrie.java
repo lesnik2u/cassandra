@@ -216,9 +216,6 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
             // Deletion ranges active at entry and exit must be presented by the tail at its root. To do this, get
             // the closest content in both forward and reverse direction and adjust the content that the tail reports
             // for them.
-            if (content == null)
-                setActiveState(); // prepare and store activeRange if it is needed
-
             S rootDescentContent = getTailRootContent(this.direction, content, activeIsSet, activeRange);
             S rootAscentContent = getTailRootContent(this.direction.opposite(), getAscentPathContent(), false, null);
             if (this.direction != direction)
@@ -274,6 +271,7 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
             this.rootAscentContent = rootAscentContent;
             if (rootAscentContent != null)
                 addBacktrack(NONE, 0, -1);
+            prevContent = null;
             updateActiveAndReturn(encodedPosition());
         }
 
