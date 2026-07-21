@@ -338,7 +338,16 @@ abstract class MergeCursor<T, C extends Cursor<T>, U, D extends Cursor<U>, R> im
         {
             super(c1, c2);
             this.deletionsAtFixedPoints = deletionsAtFixedPoints;
-            // descendants must call maybeAddDeletionsBranch(c1.encodedPosition)
+            // descendants must call maybeAddDeletionsBranch(this.encodedPosition())
+        }
+
+        @Override
+        public long encodedPosition()
+        {
+            long pos = super.encodedPosition();
+            if (!deletionsAtFixedPoints && deletionBranchDepth != -1 && Cursor.depth(pos) > deletionBranchDepth)
+                pos &= ~MAY_HAVE_DELETION_BRANCH_BIT;
+            return pos;
         }
 
         @Override
@@ -368,12 +377,17 @@ abstract class MergeCursor<T, C extends Cursor<T>, U, D extends Cursor<U>, R> im
                 assert !c2.hasDeletions();
             }
 
-            if (atC1 && atC2 && // otherwise even if there is deletion, the other cursor is ahead of it and can't be affected
+            if (atC1 && atC2 &&
+                (encodedPosition & MAY_HAVE_DELETION_BRANCH_BIT) != 0 &&
                 (!deletionsAtFixedPoints || deletionBranchDepth == -1)) // if we already found one, don't check the other source for branches below it
             {
                 maybeAddDeletionsBranch(c1, c2);
                 maybeAddDeletionsBranch(c2, c1);
             }
+
+            if (!deletionsAtFixedPoints && deletionBranchDepth != -1 && Cursor.depth(encodedPosition) > deletionBranchDepth)
+                encodedPosition &= ~MAY_HAVE_DELETION_BRANCH_BIT;
+
             return encodedPosition;
         }
 
@@ -393,12 +407,9 @@ abstract class MergeCursor<T, C extends Cursor<T>, U, D extends Cursor<U>, R> im
             if (tgt.hasDeletions())
                 return;
 
-            if ((src.encodedPosition() & MAY_HAVE_DELETION_BRANCH_BIT) != 0)
-            {
-                RangeCursor<E> deletionsBranch = src.deletionBranchCursor(src.direction());
-                if (deletionsBranch != null)
-                    tgt.addDeletions(deletionsBranch);  // apply all src deletions to tgt
-            }
+            RangeCursor<E> deletionsBranch = DeletionAwareCursor.deletionBranch(src, src.direction());
+            if (deletionsBranch != null)
+                tgt.addDeletions(deletionsBranch);  // apply all src deletions to tgt
         }
 
 
@@ -411,14 +422,14 @@ abstract class MergeCursor<T, C extends Cursor<T>, U, D extends Cursor<U>, R> im
 
             // if one of the two cursors is ahead, it can't affect this deletion branch
             if (!atC1)
-                return maybeSetDeletionsDepth(makeRangeCursor(null, (c2.encodedPosition() & MAY_HAVE_DELETION_BRANCH_BIT) != 0 ? c2.deletionBranchCursor(direction) : null), depth);
+                return maybeSetDeletionsDepth(makeRangeCursor(null, DeletionAwareCursor.deletionBranch(c2, direction)), depth);
             if (!atC2)
-                return maybeSetDeletionsDepth(makeRangeCursor((c1.encodedPosition() & MAY_HAVE_DELETION_BRANCH_BIT) != 0 ? c1.deletionBranchCursor(direction) : null, null), depth);
+                return maybeSetDeletionsDepth(makeRangeCursor(DeletionAwareCursor.deletionBranch(c1, direction), null), depth);
 
             // We are positioned at a common branch. If one has a deletion branch, we must combine it with the
             // deletion-tree branch of the other to make sure that we merge any higher-depth deletion branch with it.
-            RangeCursor<D> b1 = (c1.encodedPosition() & MAY_HAVE_DELETION_BRANCH_BIT) != 0 ? c1.deletionBranchCursor(direction) : null;
-            RangeCursor<E> b2 = (c2.encodedPosition() & MAY_HAVE_DELETION_BRANCH_BIT) != 0 ? c2.deletionBranchCursor(direction) : null;
+            RangeCursor<D> b1 = DeletionAwareCursor.deletionBranch(c1, direction);
+            RangeCursor<E> b2 = DeletionAwareCursor.deletionBranch(c2, direction);
             if (b1 == null && b2 == null)
                 return null;
 
@@ -488,7 +499,7 @@ abstract class MergeCursor<T, C extends Cursor<T>, U, D extends Cursor<U>, R> im
                  new DeletionAwareMergeSource<>(deleter, c2),
                  deletionsAtFixedPoints);
             // We will add deletion sources to the above as we find them.
-            maybeAddDeletionsBranch(this.c1.encodedPosition());
+            maybeAddDeletionsBranch(this.encodedPosition());
         }
 
         DeletionAware(Trie.MergeResolver<T> mergeResolver,

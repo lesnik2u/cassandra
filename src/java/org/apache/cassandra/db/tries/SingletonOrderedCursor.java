@@ -36,7 +36,7 @@ class SingletonOrderedCursor<T> extends SingletonCursor<T>
     {
         super(direction, src, byteComparableVersion, value);
         this.presentOnReturnPath = presentOnReturnPath;
-        adjustNextPosition(src);
+        adjustNextPosition();
     }
 
     /// Constructor for tail tries.
@@ -63,22 +63,17 @@ class SingletonOrderedCursor<T> extends SingletonCursor<T>
     }
 
     @Override
-    void prepareNextPosition(long currentPosition)
-    {
-        super.prepareNextPosition(currentPosition);
-        adjustNextPosition(((ByteSource.Peekable) src));
-    }
-
-    private void adjustNextPosition(ByteSource.Peekable src)
+    void adjustNextPosition()
     {
         if (presentOnReturnPath)
         {
+            final ByteSource.Peekable peekableSrc = (ByteSource.Peekable) src;
             if (Cursor.isExhausted(nextPosition))
             {
                 if (Cursor.isRootPosition(currentPosition))
                     nextPosition = currentPosition | ON_RETURN_PATH_BIT;
             }
-            else if (src.peek() == ByteSource.END_OF_STREAM)
+            else if (peekableSrc.peek() == ByteSource.END_OF_STREAM)
                 nextPosition |= ON_RETURN_PATH_BIT;
         }
     }

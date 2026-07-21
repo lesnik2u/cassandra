@@ -318,8 +318,15 @@ interface Cursor<T>
     /// cursor positions.
     long encodedPosition();
 
+    static <T> T content(Cursor<T> cursor, long cursorPosition)
+    {
+        return (cursorPosition & MAY_HAVE_CONTENT_BIT) != 0 ? cursor.content() : null;
+    }
+
     /// @return the content associated with the current node. This may be non-null for any presented node, including
     ///         the root.
+    ///         It is preferable to retrieve this via the static method [Cursor#content(Cursor, long)] to avoid
+    ///         redundant content lookups.
     @Nullable
     T content();
 
@@ -505,9 +512,8 @@ interface Cursor<T>
     /// This method must only be called on a freshly constructed cursor.
     default <R> R process(Cursor.Walker<? super T, R> walker)
     {
-        assertFresh();
-        long currentPosition = encodedPosition();
-        T content = (currentPosition & MAY_HAVE_CONTENT_BIT) != 0 ? content() : null;
+        long currentPosition = getPositionAndAssertFresh();
+        T content = content(this, currentPosition);
         if (content == null)
             content = advanceToContent(walker);
 
@@ -530,9 +536,8 @@ interface Cursor<T>
     /// This method should only be called on a freshly constructed cursor.
     default <R> R processSkippingBranches(Cursor.Walker<? super T, R> walker)
     {
-        assertFresh();
-        long currentPosition = encodedPosition();
-        T content = (currentPosition & MAY_HAVE_CONTENT_BIT) != 0 ? content() : null;
+        long currentPosition = getPositionAndAssertFresh();
+        T content = content(this, currentPosition);
         if (content != null)
         {
             walker.content(content);
@@ -549,7 +554,7 @@ interface Cursor<T>
                 break;
             walker.resetPathLength(depth(current) - 1);
             walker.addPathByte(incomingTransition(current));
-            content = (current & MAY_HAVE_CONTENT_BIT) != 0 ? content() : null;
+            content = content(this, current);
             if (content == null)
                 content = advanceToContent(walker);
         }
@@ -627,6 +632,13 @@ interface Cursor<T>
 
     default void assertFresh()
     {
-        assert depth(encodedPosition()) == 0 : "The provided cursor has already been advanced.";
+        getPositionAndAssertFresh();
+    }
+
+    default long getPositionAndAssertFresh()
+    {
+        long pos = encodedPosition();
+        assert depth(pos) == 0 : "The provided cursor has already been advanced.";
+        return pos;
     }
 }

@@ -74,6 +74,13 @@ public interface DeletionAwareCursor<T, D extends RangeState<D>> extends Cursor<
     /// @return A range cursor for deletions at this position, or null if no deletion branch is defined at this level.
     RangeCursor<D> deletionBranchCursor(Direction direction);
 
+    static <T, D extends RangeState<D>> RangeCursor<D> deletionBranch(DeletionAwareCursor<T, D> cursor, Direction direction)
+    {
+        return cursor != null && (cursor.encodedPosition() & MAY_HAVE_DELETION_BRANCH_BIT) != 0
+               ? cursor.deletionBranchCursor(direction)
+               : null;
+    }
+
     @Override
     DeletionAwareCursor<T, D> tailCursor(Direction direction);
 
@@ -82,11 +89,14 @@ public interface DeletionAwareCursor<T, D extends RangeState<D>> extends Cursor<
     /// deletion branches.
     default <R> R process(DeletionAwareWalker<? super T, ? super D, R> walker)
     {
-        assertFresh();
-        long currentPosition = encodedPosition();
+        long currentPosition = getPositionAndAssertFresh();
 
         while (true)
         {
+            T content = Cursor.content(this, currentPosition);
+            if (content != null)
+                walker.content(content);
+
             if ((currentPosition & MAY_HAVE_DELETION_BRANCH_BIT) != 0)
             {
                 RangeCursor<D> deletionBranch = deletionBranchCursor(direction());
@@ -95,14 +105,6 @@ public interface DeletionAwareCursor<T, D extends RangeState<D>> extends Cursor<
                     processDeletionBranch(walker, deletionBranch);
                     walker.exitDeletionsBranch();
                 }
-            }
-            
-            // MAY_HAVE_CONTENT_BIT optimization: only call content() if flag indicates potential content
-            if ((currentPosition & MAY_HAVE_CONTENT_BIT) != 0)
-            {
-                T content = content();
-                if (content != null)
-                    walker.content(content);
             }
 
             long prevPosition = currentPosition;
@@ -179,7 +181,7 @@ public interface DeletionAwareCursor<T, D extends RangeState<D>> extends Cursor<
         {
             if (state == State.C1_ONLY)
             {
-                if ((c1.encodedPosition() & MAY_HAVE_DELETION_BRANCH_BIT) != 0)
+                if ((encodedPosition & MAY_HAVE_DELETION_BRANCH_BIT) != 0)
                 {
                     RangeCursor<D> deletionsBranch = c1.deletionBranchCursor(direction());
                     if (deletionsBranch != null)

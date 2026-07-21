@@ -269,6 +269,12 @@ abstract class PrefixedCursor<T, C extends Cursor<T>> extends DepthAdjustedCurso
         }
 
         @Override
+        long completeAdvanceInTail(long position)
+        {
+            return super.completeAdvanceInTail(position & ~MAY_HAVE_DELETION_BRANCH_BIT);
+        }
+
+        @Override
         public long encodedPosition()
         {
             long pos = super.encodedPosition();

@@ -129,7 +129,7 @@ extends InMemoryBaseTrie<T> implements DeletionAwareTrie<T, D>
         T processPrefix(int node, int depth, int transition)
         {
             T content = super.processPrefix(node, depth, transition);
-            if (trie.getAlternateBranch(node) != NONE)
+            if (trie.getIntVolatile(node + PREFIX_ALTERNATE_OFFSET) != NONE)
                 currentPosition |= MAY_HAVE_DELETION_BRANCH_BIT;
             return content;
         }

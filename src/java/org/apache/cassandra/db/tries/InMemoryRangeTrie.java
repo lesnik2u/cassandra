@@ -137,8 +137,6 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
         {
             if (!Cursor.isExhausted(position))
             {
-                currentPosition = position;
-
                 // Always check if we are seeing new content; if we do, that's an easy state update.
                 S content = this.content;
                 if (content != null)
@@ -276,10 +274,11 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
             this.rootAscentContent = rootAscentContent;
             if (rootAscentContent != null)
                 addBacktrack(NONE, 0, -1);
-            setNodeState(currentPosition, rootDescentContent, currentFullNode, currentNode);
+            assert currentFullNode == root && currentNode == root;
+            long rootPos = encodedPosition();
             if (rootDescentContent != null)
-                currentPosition |= MAY_HAVE_CONTENT_BIT;
-            updateActiveAndReturn(currentPosition);
+                setNodeState(rootPos | MAY_HAVE_CONTENT_BIT, rootDescentContent, root, root);
+            updateActiveAndReturn(rootPos);
         }
 
         @Override

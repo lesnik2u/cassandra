@@ -562,9 +562,13 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         /// partition roots), we can use this optimization.
         final boolean deletionsAtFixedPoints;
 
+        boolean initialized = true;
+
         @Override
         long collectFlagsMask()
         {
+            if (initialized && !deletionsAtFixedPoints && deletionBranchDepth != -1 && Cursor.depth(super.encodedPosition()) > deletionBranchDepth)
+                return Cursor.MAY_HAVE_CONTENT_BIT;
             return Cursor.MAY_HAVE_CONTENT_BIT | Cursor.MAY_HAVE_DELETION_BRANCH_BIT;
         }
 
@@ -693,7 +697,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
             // If the branch is single-source, its deletions cannot affect the merge as they can't delete its own data.
             // (Note that covering deletions from other sources can still affect it though.)
             // Otherwise we need to get the deletions from all sources to track and apply them.
-            if (branchHasMultipleSources())
+            if (branchHasMultipleSources() && (contentPosition & Cursor.MAY_HAVE_DELETION_BRANCH_BIT) != 0)
             {
                 RangeCursor<D> deletions = deletionsAtFixedPoints ? makeRelevantDeletionsFixedPoints()
                                                                   : makeRelevantDeletionsNoFixedPoints();
@@ -721,13 +725,9 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         /// deletion branches must be presented at shared positions.
         void addDeletionTrieBranchFixedPoints(DeletionAwareCursor<T,D> cursor)
         {
-            if ((cursor.encodedPosition() & Cursor.MAY_HAVE_DELETION_BRANCH_BIT) != 0)
-            {
-                RangeCursor<D> deletionsBranch = cursor.deletionBranchCursor(direction);
-                if (deletionsBranch != null)
-                    collectedDeletionBranches.add(deletionsBranch);
-            }
-            // Otherwise there is no need to track the subtrie. If there are deletions, they must be presented here.
+            RangeCursor<D> deletionsBranch = DeletionAwareCursor.deletionBranch(cursor, direction);
+            if (deletionsBranch != null)
+                collectedDeletionBranches.add(deletionsBranch);
         }
 
         private RangeCursor<D> makeRelevantDeletionsNoFixedPoints()
@@ -751,14 +751,11 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         /// substructure.
         void addDeletionTrieBranchNoFixedPoints(DeletionAwareCursor<T,D> cursor)
         {
-            if ((cursor.encodedPosition() & Cursor.MAY_HAVE_DELETION_BRANCH_BIT) != 0)
+            RangeCursor<D> deletionsBranch = DeletionAwareCursor.deletionBranch(cursor, direction);
+            if (deletionsBranch != null)
             {
-                RangeCursor<D> deletionsBranch = cursor.deletionBranchCursor(direction);
-                if (deletionsBranch != null)
-                {
-                    collectedDeletionBranches.add(deletionsBranch);
-                    return;
-                }
+                collectedDeletionBranches.add(deletionsBranch);
+                return;
             }
             sourcesWithNoDeletionBranch.add(cursor);
         }
@@ -798,6 +795,15 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
             if (deletion == null)
                 return content;
             return deleter.apply(deletion, content);
+        }
+
+        @Override
+        public long encodedPosition()
+        {
+            long pos = super.encodedPosition();
+            if (!deletionsAtFixedPoints && deletionBranchDepth != -1 && Cursor.depth(pos) > deletionBranchDepth)
+                pos &= ~Cursor.MAY_HAVE_DELETION_BRANCH_BIT;
+            return pos;
         }
 
         /// Returns the deletion branch cursor for the current position.
