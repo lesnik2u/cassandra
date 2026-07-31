@@ -656,7 +656,8 @@ extends BaseTrie<T, DeletionAwareCursor<T, D>, DeletionAwareTrie<T, D>>
         ByteSource bytes = prefix.asComparableBytes(c.byteComparableVersion());
         while (true)
         {
-            if ((c.encodedPosition() & Cursor.MAY_HAVE_DELETION_BRANCH_BIT) != 0)
+            long currentPosition = c.encodedPosition();
+            if ((currentPosition & Cursor.MAY_HAVE_DELETION_BRANCH_BIT) != 0)
             {
                 RangeCursor<D> deletionBranch = c.deletionBranchCursor(Direction.FORWARD);
                 if (deletionBranch != null)
@@ -664,10 +665,9 @@ extends BaseTrie<T, DeletionAwareCursor<T, D>, DeletionAwareTrie<T, D>>
             }
 
             int next = bytes.next();
-            long position = c.encodedPosition();
             if (next == ByteSource.END_OF_STREAM)
                 return c::tailCursor;
-            long nextPosition = Cursor.positionForDescentWithByte(position, next);
+            long nextPosition = Cursor.positionForDescentWithByte(currentPosition, next);
             if (Cursor.compare(c.skipTo(nextPosition), nextPosition) != 0)
                 return null;
         }

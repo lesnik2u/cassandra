@@ -94,7 +94,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
     /// The collected content.
     T collectedContent;
 
-    private long currentPosition;
+    long currentPosition;
 
     <I> CollectionMergeCursor(Trie.CollectionMergeResolver<T> resolver, Direction direction, Collection<I> inputs, IntFunction<C[]> cursorArrayConstructor, BiFunction<I, Direction, C> extractor)
     {
@@ -219,6 +219,13 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         return Cursor.MAY_HAVE_CONTENT_BIT;
     }
 
+    /// Called after the current position flags have been collected and cached.
+    /// Override in subclasses to adjust the cached flags.
+    /// The base implementation does nothing.
+    void adjustFlags()
+    {
+    }
+
     /// Collects and caches the current position by unioning flags from all cursors at the same position.
     /// This is called after advancing to ensure the position is always up-to-date.
     private long collectAndCachePositionFlags()
@@ -228,12 +235,14 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         if (Cursor.isExhausted(pos) || !branchHasMultipleSources())
         {
             currentPosition = pos;
+            adjustFlags();
             return currentPosition;
         }
 
         if ((pos & mask) == mask)
         {
             currentPosition = pos;
+            adjustFlags();
             return currentPosition;
         }
 
@@ -241,6 +250,8 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
 
         // Walk the heap to collect flags from all equal cursors, stopping early if all flags are collected
         applyToSelectedElementsInHeap(FLAG_COLLECTOR, 0);
+
+        adjustFlags();
 
         // Position bits must match for all selected cursors, so we don't need unionFlags
         return currentPosition;
@@ -300,7 +311,8 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         if (cmp < 0)
         {
             currentPosition = headPosition;
-            return headPosition;   // head is still smallest
+            adjustFlags();
+            return currentPosition;   // head is still smallest
         }
 
         if (cmp > 0)
@@ -562,14 +574,26 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         /// partition roots), we can use this optimization.
         final boolean deletionsAtFixedPoints;
 
-        boolean initialized = true;
 
+        /// Returns the mask of flag bits to collect from sources. When deletionsAtFixedPoints is true,
+        /// the sources will not have MAY_HAVE_DELETION_BRANCH_BIT set, so we skip collecting it to
+        /// avoid unnecessary heap walking.
         @Override
         long collectFlagsMask()
         {
-            if (initialized && !deletionsAtFixedPoints && deletionBranchDepth != -1 && Cursor.depth(super.encodedPosition()) > deletionBranchDepth)
+            if (deletionsAtFixedPoints)
                 return Cursor.MAY_HAVE_CONTENT_BIT;
             return Cursor.MAY_HAVE_CONTENT_BIT | Cursor.MAY_HAVE_DELETION_BRANCH_BIT;
+        }
+
+        /// Adjusts the cached position flags by clearing the MAY_HAVE_DELETION_BRANCH_BIT when we are
+        /// deeper than a known deletion branch depth. The !deletionsAtFixedPoints check is an optimization:
+        /// in fixed-point mode the flag should not be set in any of the sources, so there is nothing to clear.
+        @Override
+        void adjustFlags()
+        {
+            if (!deletionsAtFixedPoints && deletionBranchDepth != -1 && Cursor.depth(currentPosition) > deletionBranchDepth)
+                currentPosition &= ~Cursor.MAY_HAVE_DELETION_BRANCH_BIT;
         }
 
         RangeCursor<D> relevantDeletions;
@@ -795,15 +819,6 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
             if (deletion == null)
                 return content;
             return deleter.apply(deletion, content);
-        }
-
-        @Override
-        public long encodedPosition()
-        {
-            long pos = super.encodedPosition();
-            if (!deletionsAtFixedPoints && deletionBranchDepth != -1 && Cursor.depth(pos) > deletionBranchDepth)
-                pos &= ~Cursor.MAY_HAVE_DELETION_BRANCH_BIT;
-            return pos;
         }
 
         /// Returns the deletion branch cursor for the current position.

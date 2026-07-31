@@ -318,6 +318,8 @@ interface Cursor<T>
     /// cursor positions.
     long encodedPosition();
 
+    /// Returns the content associated with the cursor's current node, or null if the position does not have the
+    /// [#MAY_HAVE_CONTENT_BIT] flag set. This avoids redundant content lookups when the flag indicates no content.
     static <T> T content(Cursor<T> cursor, long cursorPosition)
     {
         return (cursorPosition & MAY_HAVE_CONTENT_BIT) != 0 ? cursor.content() : null;
@@ -325,8 +327,9 @@ interface Cursor<T>
 
     /// @return the content associated with the current node. This may be non-null for any presented node, including
     ///         the root.
-    ///         It is preferable to retrieve this via the static method [Cursor#content(Cursor, long)] to avoid
-    ///         redundant content lookups.
+    ///         It is preferable to retrieve this via the static method [Cursor#content(Cursor, long)] to take
+    ///         advantage of the [#MAY_HAVE_CONTENT_BIT] flag and avoid megamorphic calls to this method unless
+    ///         content is actually present.
     @Nullable
     T content();
 
@@ -544,19 +547,23 @@ interface Cursor<T>
             return walker.complete();
         }
         content = advanceToContent(walker);
+        currentPosition = encodedPosition();
 
         while (content != null)
         {
             walker.content(content);
             // skip over the branch by requesting a position that is beyond
-            long current = skipTo(positionForSkippingBranch(encodedPosition()));
-            if (isExhausted(current))
+            currentPosition = skipTo(positionForSkippingBranch(currentPosition));
+            if (isExhausted(currentPosition))
                 break;
-            walker.resetPathLength(depth(current) - 1);
-            walker.addPathByte(incomingTransition(current));
-            content = content(this, current);
+            walker.resetPathLength(depth(currentPosition) - 1);
+            walker.addPathByte(incomingTransition(currentPosition));
+            content = content(this, currentPosition);
             if (content == null)
+            {
                 content = advanceToContent(walker);
+                currentPosition = encodedPosition();
+            }
         }
         return walker.complete();
     }
