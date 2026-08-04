@@ -235,7 +235,7 @@ class SingletonCursor<T> implements Cursor<T>
         void adjustNextPosition()
         {
             if (Cursor.isExhausted(nextPosition))
-                currentPosition |= MAY_HAVE_DELETION_BRANCH_BIT;
+                currentPosition = (currentPosition & ~MAY_HAVE_CONTENT_BIT) | MAY_HAVE_DELETION_BRANCH_BIT;
         }
 
         @Override
@@ -244,9 +244,18 @@ class SingletonCursor<T> implements Cursor<T>
             long pos = super.advanceMultiple(receiver);
             if (!Cursor.isExhausted(pos))
             {
-                currentPosition |= MAY_HAVE_DELETION_BRANCH_BIT;
+                currentPosition = (currentPosition & ~MAY_HAVE_CONTENT_BIT) | MAY_HAVE_DELETION_BRANCH_BIT;
                 pos = currentPosition;
             }
+            return pos;
+        }
+
+        @Override
+        public long encodedPosition()
+        {
+            long pos = super.encodedPosition();
+            if (atEnd())
+                pos = (pos & ~MAY_HAVE_CONTENT_BIT) | MAY_HAVE_DELETION_BRANCH_BIT;
             return pos;
         }
 

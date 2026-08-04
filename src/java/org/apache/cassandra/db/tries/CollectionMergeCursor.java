@@ -222,8 +222,10 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
     /// Called after the current position flags have been collected and cached.
     /// Override in subclasses to adjust the cached flags.
     /// The base implementation does nothing.
-    void adjustFlags()
+    /// Returns the updated currentPosition.
+    long adjustFlags()
     {
+        return currentPosition;
     }
 
     /// Collects and caches the current position by unioning flags from all cursors at the same position.
@@ -235,15 +237,13 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         if (Cursor.isExhausted(pos) || !branchHasMultipleSources())
         {
             currentPosition = pos;
-            adjustFlags();
-            return currentPosition;
+            return adjustFlags();
         }
 
         if ((pos & mask) == mask)
         {
             currentPosition = pos;
-            adjustFlags();
-            return currentPosition;
+            return adjustFlags();
         }
 
         currentPosition = pos;
@@ -311,8 +311,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         if (cmp < 0)
         {
             currentPosition = headPosition;
-            adjustFlags();
-            return currentPosition;   // head is still smallest
+            return adjustFlags();   // head is still smallest
         }
 
         if (cmp > 0)
@@ -581,7 +580,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         @Override
         long collectFlagsMask()
         {
-            if (deletionsAtFixedPoints)
+            if (deletionsAtFixedPoints || (deletionBranchDepth != -1 && Cursor.depth(currentPosition) > deletionBranchDepth))
                 return Cursor.MAY_HAVE_CONTENT_BIT;
             return Cursor.MAY_HAVE_CONTENT_BIT | Cursor.MAY_HAVE_DELETION_BRANCH_BIT;
         }
@@ -590,10 +589,11 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         /// deeper than a known deletion branch depth. The !deletionsAtFixedPoints check is an optimization:
         /// in fixed-point mode the flag should not be set in any of the sources, so there is nothing to clear.
         @Override
-        void adjustFlags()
+        long adjustFlags()
         {
             if (!deletionsAtFixedPoints && deletionBranchDepth != -1 && Cursor.depth(currentPosition) > deletionBranchDepth)
                 currentPosition &= ~Cursor.MAY_HAVE_DELETION_BRANCH_BIT;
+            return currentPosition;
         }
 
         RangeCursor<D> relevantDeletions;
