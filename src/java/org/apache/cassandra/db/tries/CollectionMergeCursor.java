@@ -251,10 +251,8 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         // Walk the heap to collect flags from all equal cursors, stopping early if all flags are collected
         applyToSelectedElementsInHeap(FLAG_COLLECTOR, 0);
 
-        adjustFlags();
-
         // Position bits must match for all selected cursors, so we don't need unionFlags
-        return currentPosition;
+        return adjustFlags();
     }
 
     /// HeapOp to collect flags from heap cursors, with early termination when all flags are collected
@@ -573,29 +571,6 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         /// partition roots), we can use this optimization.
         final boolean deletionsAtFixedPoints;
 
-
-        /// Returns the mask of flag bits to collect from sources. When deletionsAtFixedPoints is true,
-        /// the sources will not have MAY_HAVE_DELETION_BRANCH_BIT set, so we skip collecting it to
-        /// avoid unnecessary heap walking.
-        @Override
-        long collectFlagsMask()
-        {
-            if (deletionsAtFixedPoints || (deletionBranchDepth != -1 && Cursor.depth(currentPosition) > deletionBranchDepth))
-                return Cursor.MAY_HAVE_CONTENT_BIT;
-            return Cursor.MAY_HAVE_CONTENT_BIT | Cursor.MAY_HAVE_DELETION_BRANCH_BIT;
-        }
-
-        /// Adjusts the cached position flags by clearing the MAY_HAVE_DELETION_BRANCH_BIT when we are
-        /// deeper than a known deletion branch depth. The !deletionsAtFixedPoints check is an optimization:
-        /// in fixed-point mode the flag should not be set in any of the sources, so there is nothing to clear.
-        @Override
-        long adjustFlags()
-        {
-            if (!deletionsAtFixedPoints && deletionBranchDepth != -1 && Cursor.depth(currentPosition) > deletionBranchDepth)
-                currentPosition &= ~Cursor.MAY_HAVE_DELETION_BRANCH_BIT;
-            return currentPosition;
-        }
-
         RangeCursor<D> relevantDeletions;
         int deletionBranchDepth = -1;
 
@@ -668,6 +643,38 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
                    : processRelevantDeletions(super.advanceMultiple(receiver));
         }
 
+        /// Returns the mask of flag bits to collect from sources. When we are already under a deletion, we
+        /// do not need to collect the deletion branch bit because we are not going to expose it to our callers
+        /// (as we report it as part of the deletion branch we are under).
+        @Override
+        long collectFlagsMask()
+        {
+            if (underDeletionBranch())
+                return Cursor.MAY_HAVE_CONTENT_BIT;
+            return Cursor.MAY_HAVE_CONTENT_BIT | Cursor.MAY_HAVE_DELETION_BRANCH_BIT;
+        }
+
+        /// Adjusts the cached position flags by clearing the MAY_HAVE_DELETION_BRANCH_BIT when we are
+        /// deeper than a known deletion branch depth. [#collectFlagsMask] is not sufficient for this, because it
+        /// is only used to decide when to stop collecting; e.g. if we are in a single-source path, the source's flags
+        /// will be collected unchanged.
+        /// We only need to do this when `deletionsAtFixedPoints` is not in force, because when it is no source can have
+        /// a deletion branch below the common deletion root.
+        @Override
+        long adjustFlags()
+        {
+            if (!deletionsAtFixedPoints && underDeletionBranch())
+                currentPosition &= ~Cursor.MAY_HAVE_DELETION_BRANCH_BIT;
+            return currentPosition;
+        }
+
+        private boolean underDeletionBranch()
+        {
+            // Note: this will be also called before we are fully initialized. The condition below will not fire as
+            // deletionBranchDepth and depth(currentPosition) are both 0.
+            return deletionBranchDepth != -1 && Cursor.depth(currentPosition) > deletionBranchDepth;
+        }
+
         /// Adjusts the deletion state based on the relative positions of deletion and content cursors.
         /// This determines how deletions should be applied to live data at the current position.
         void adjustDeletionState(long deletionPosition, long contentPosition)
@@ -719,7 +726,6 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
             }
 
             // If the branch is single-source, its deletions cannot affect the merge as they can't delete its own data.
-            // (Note that covering deletions from other sources can still affect it though.)
             // Otherwise we need to get the deletions from all sources to track and apply them.
             if (branchHasMultipleSources() && (contentPosition & Cursor.MAY_HAVE_DELETION_BRANCH_BIT) != 0)
             {

@@ -579,7 +579,7 @@ abstract class MergeCursor<T, C extends Cursor<T>, U, D extends Cursor<U>, R> im
                  new DeletionAwareMergeSource<>(deleter2, c2),
                  deletionsAtFixedPoints);
             // We will add deletion sources to the above as we find them.
-            maybeAddDeletionsBranch(this.c1.encodedPosition());
+            maybeAddDeletionsBranch(this.encodedPosition());
         }
 
         DeletionAwareMapping(BiFunction<T, S, R> mergeResolver,
