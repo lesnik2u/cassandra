@@ -57,18 +57,14 @@ class SingletonCursor<T> implements Cursor<T>
         this.src = src;
         this.byteComparableVersion = byteComparableVersion;
         this.value = value;
-        this.currentPosition = Cursor.rootPosition(direction);
+        this.currentPosition = Cursor.unionFlags(Cursor.rootPosition(direction), currentPosition, Cursor.FLAGS_MASK);
         if (!Cursor.isExhausted(nextPosition))
             this.nextPosition = nextPosition - Cursor.depthCorrectionValue(currentPosition);
         else
-        {
             this.nextPosition = nextPosition;
-            this.currentPosition |= MAY_HAVE_CONTENT_BIT;
-        }
 
         if (direction != Cursor.direction(currentPosition))
             this.nextPosition ^= Cursor.TRANSITION_MASK;
-        adjustNextPosition();
     }
 
     /// Adjusts the current position flags (e.g. setting MAY_HAVE_CONTENT_BIT when at the end)
@@ -82,13 +78,14 @@ class SingletonCursor<T> implements Cursor<T>
         else
         {
             nextPosition = Cursor.exhaustedPosition(currentPosition);
-            currentPosition |= MAY_HAVE_CONTENT_BIT;
+            currentPosition |= payloadFlag();
         }
-        adjustNextPosition();
     }
 
-    void adjustNextPosition()
+    /// The flag to set at the end of the path. Normally content, overridden by [DeletionBranch]
+    long payloadFlag()
     {
+        return MAY_HAVE_CONTENT_BIT;
     }
 
     @Override
@@ -121,7 +118,7 @@ class SingletonCursor<T> implements Cursor<T>
         currentPosition = Cursor.positionForDescentWithByte(pos, current);
         nextPosition = Cursor.exhaustedPosition(currentPosition);
         // atEnd() is unconditionally true here; set the bit directly.
-        currentPosition |= MAY_HAVE_CONTENT_BIT;
+        currentPosition |= payloadFlag();
         return currentPosition;
     }
 
@@ -232,31 +229,9 @@ class SingletonCursor<T> implements Cursor<T>
         }
 
         @Override
-        void adjustNextPosition()
+        long payloadFlag()
         {
-            if (Cursor.isExhausted(nextPosition))
-                currentPosition = (currentPosition & ~MAY_HAVE_CONTENT_BIT) | MAY_HAVE_DELETION_BRANCH_BIT;
-        }
-
-        @Override
-        public long advanceMultiple(TransitionsReceiver receiver)
-        {
-            long pos = super.advanceMultiple(receiver);
-            if (!Cursor.isExhausted(pos))
-            {
-                currentPosition = (currentPosition & ~MAY_HAVE_CONTENT_BIT) | MAY_HAVE_DELETION_BRANCH_BIT;
-                pos = currentPosition;
-            }
-            return pos;
-        }
-
-        @Override
-        public long encodedPosition()
-        {
-            long pos = super.encodedPosition();
-            if (atEnd())
-                pos = (pos & ~MAY_HAVE_CONTENT_BIT) | MAY_HAVE_DELETION_BRANCH_BIT;
-            return pos;
+            return MAY_HAVE_DELETION_BRANCH_BIT;
         }
 
         @Override
