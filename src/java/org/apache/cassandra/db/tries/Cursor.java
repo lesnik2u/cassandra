@@ -204,6 +204,10 @@ interface Cursor<T>
         return (encodedPosition & ON_RETURN_PATH_BIT) != 0;
     }
 
+    /// Compare two encoded position, returning a negative number if the left is earlier in iteration order, 0 if both
+    /// are at the same position, and a positive number if the right is earlier.
+    ///
+    /// For the result to be meaningful, the positions must be obtained in the process of performing a parallel walk.
     static long compare(long encoded1, long encoded2)
     {
         // This can support depth of 2^31 - 1 without overflowing.
