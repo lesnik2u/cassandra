@@ -74,10 +74,10 @@ public interface DeletionAwareCursor<T, D extends RangeState<D>> extends Cursor<
     /// @return A range cursor for deletions at this position, or null if no deletion branch is defined at this level.
     RangeCursor<D> deletionBranchCursor(Direction direction);
 
-    static <T, D extends RangeState<D>> RangeCursor<D> deletionBranch(DeletionAwareCursor<T, D> cursor, Direction direction)
+    static <T, D extends RangeState<D>> RangeCursor<D> deletionBranchCursor(DeletionAwareCursor<T, D> cursor, long encodedPosition)
     {
-        return cursor != null && (cursor.encodedPosition() & MAY_HAVE_DELETION_BRANCH_BIT) != 0
-               ? cursor.deletionBranchCursor(direction)
+        return (encodedPosition & MAY_HAVE_DELETION_BRANCH_BIT) != 0
+               ? cursor.deletionBranchCursor(Cursor.direction(encodedPosition))
                : null;
     }
 
@@ -97,14 +97,11 @@ public interface DeletionAwareCursor<T, D extends RangeState<D>> extends Cursor<
             if (content != null)
                 walker.content(content);
 
-            if ((currentPosition & MAY_HAVE_DELETION_BRANCH_BIT) != 0)
+            RangeCursor<D> deletionBranch = deletionBranchCursor(this, currentPosition);
+            if (deletionBranch != null && walker.enterDeletionsBranch())
             {
-                RangeCursor<D> deletionBranch = deletionBranchCursor(direction());
-                if (deletionBranch != null && walker.enterDeletionsBranch())
-                {
-                    processDeletionBranch(walker, deletionBranch);
-                    walker.exitDeletionsBranch();
-                }
+                processDeletionBranch(walker, deletionBranch);
+                walker.exitDeletionsBranch();
             }
 
             long prevPosition = currentPosition;
@@ -181,14 +178,11 @@ public interface DeletionAwareCursor<T, D extends RangeState<D>> extends Cursor<
         {
             if (state == State.C1_ONLY)
             {
-                if ((encodedPosition & MAY_HAVE_DELETION_BRANCH_BIT) != 0)
-                {
-                    RangeCursor<D> deletionsBranch = c1.deletionBranchCursor(direction());
-                    if (deletionsBranch != null)
-                        addCursor(deletionsBranch);
-                }
+                RangeCursor<D> deletionsBranch = DeletionAwareCursor.deletionBranchCursor(c1, encodedPosition);
+                if (deletionsBranch != null)
+                    addCursor(deletionsBranch);
             }
-            return encodedPosition;
+            return encodedPosition & ~MAY_HAVE_DELETION_BRANCH_BIT;
         }
 
         @Override
@@ -416,7 +410,7 @@ public interface DeletionAwareCursor<T, D extends RangeState<D>> extends Cursor<
                     // already in deletion branch
                     break;
                 case C1_ONLY:
-                    RangeCursor<D> deletionsBranch = c1.deletionBranchCursor(direction());
+                    RangeCursor<D> deletionsBranch = DeletionAwareCursor.deletionBranchCursor(c1, encodedPosition);
                     if (deletionsBranch != null)
                     {
                         addCursor(deletionsBranch);
@@ -429,7 +423,7 @@ public interface DeletionAwareCursor<T, D extends RangeState<D>> extends Cursor<
                 default:
                     throw new AssertionError("Deletion branch extends above its introduction");
             }
-            return encodedPosition;
+            return encodedPosition & ~MAY_HAVE_DELETION_BRANCH_BIT;
         }
 
         @Override

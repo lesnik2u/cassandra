@@ -755,7 +755,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         /// deletion branches must be presented at shared positions.
         void addDeletionTrieBranchFixedPoints(DeletionAwareCursor<T,D> cursor)
         {
-            RangeCursor<D> deletionsBranch = DeletionAwareCursor.deletionBranch(cursor, direction);
+            RangeCursor<D> deletionsBranch = cursor.deletionBranchCursor(direction);
             if (deletionsBranch != null)
                 collectedDeletionBranches.add(deletionsBranch);
         }
@@ -781,7 +781,7 @@ abstract class CollectionMergeCursor<T, C extends Cursor<T>> implements Cursor<T
         /// substructure.
         void addDeletionTrieBranchNoFixedPoints(DeletionAwareCursor<T,D> cursor)
         {
-            RangeCursor<D> deletionsBranch = DeletionAwareCursor.deletionBranch(cursor, direction);
+            RangeCursor<D> deletionsBranch = cursor.deletionBranchCursor(direction);
             if (deletionsBranch != null)
             {
                 collectedDeletionBranches.add(deletionsBranch);

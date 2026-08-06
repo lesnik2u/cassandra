@@ -304,9 +304,7 @@ extends InMemoryBaseTrie<T> implements DeletionAwareTrie<T, D>
                 applyContent((position & Cursor.MAY_HAVE_CONTENT_BIT) != 0 ? mutationCursor.content() : null);
 
                 int existingAlternateBranch = state.alternateBranch();
-                RangeCursor<E> incomingAlternateBranch = (position & Cursor.MAY_HAVE_DELETION_BRANCH_BIT) != 0
-                                                         ? mutationCursor.deletionBranchCursor(Direction.FORWARD)
-                                                         : null;
+                RangeCursor<E> incomingAlternateBranch = DeletionAwareCursor.deletionBranchCursor(mutationCursor, position);
                 if (incomingAlternateBranch != null || existingAlternateBranch != NONE)
                 {
                     int updatedAlternateBranch = existingAlternateBranch;
