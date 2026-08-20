@@ -19,7 +19,6 @@
 package org.apache.cassandra.db.tries;
 
 import java.io.IOException;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.Assert;
 import org.junit.BeforeClass;
