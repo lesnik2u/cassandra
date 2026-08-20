@@ -28,7 +28,6 @@ import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
-import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.BufferPools;
