@@ -95,7 +95,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
                         int rowCountIncludingStatic,
                         int tombstoneCount,
                         int dataSize,
-                        InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie)
+                        DeletionAwareTrie<Object, TrieTombstoneMarker> trie)
     {
         this(metadata, key, columns, stats, rowCountIncludingStatic, tombstoneCount, dataSize, -1, trie);
     }
@@ -108,7 +108,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
                         int tombstoneCount,
                         int dataSize,
                         int cellCount,
-                        InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie)
+                        DeletionAwareTrie<Object, TrieTombstoneMarker> trie)
     {
         super(key, columns, stats, rowCountIncludingStatic, tombstoneCount, trie, metadata);
         this.dataSize = dataSize;

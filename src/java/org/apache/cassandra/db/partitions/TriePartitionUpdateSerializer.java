@@ -19,6 +19,9 @@
 package org.apache.cassandra.db.partitions;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+
+import com.google.common.primitives.Ints;
 
 import org.apache.cassandra.db.Columns;
 import org.apache.cassandra.db.DecoratedKey;
@@ -36,14 +39,17 @@ import org.apache.cassandra.db.rows.SerializationHelper;
 import org.apache.cassandra.db.rows.TrieBackedRow;
 import org.apache.cassandra.db.rows.TrieTombstoneMarker;
 import org.apache.cassandra.db.rows.UnfilteredSerializer;
+import org.apache.cassandra.db.tries.DeletionAwareFileWriter;
+import org.apache.cassandra.db.tries.DeletionAwareTrie;
+import org.apache.cassandra.db.tries.FileWriter;
+import org.apache.cassandra.db.tries.OnDiskCursor;
+import org.apache.cassandra.db.tries.OnDiskDeletionAwareTrie;
+import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.db.tries.ContentManagerPojo;
-import org.apache.cassandra.db.tries.InMemoryBaseTrie;
 import org.apache.cassandra.db.tries.InMemoryDeletionAwareTrie;
-import org.apache.cassandra.db.tries.TrieSpaceExhaustedException;
 import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
-import com.google.common.primitives.Ints;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
@@ -89,11 +95,79 @@ public class TriePartitionUpdateSerializer
 
         ContentManagerPojo.PojoSerializer<Object> pojoSerializer = createPojoSerializer(trieUpdate.metadata(), helper, header, version, null);
 
-        @SuppressWarnings("unchecked")
-        InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie =
-            (InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>) trieUpdate.trie();
+        writeTrie(trieUpdate.trie(), pojoSerializer, out);
+    }
 
-        trie.serialize(out, pojoSerializer);
+    /// Writes the trie in the on-disk trie format, length-prefixed.
+    ///
+    /// The length is needed because the reader walks the serialized form in place rather than
+    /// consuming it from the stream, so it has to be handed the trie's bytes as a block. The
+    /// writer emits the root last and pointers run backwards, so the trie is only readable once
+    /// its extent is known.
+    private static void writeTrie(DeletionAwareTrie<Object, TrieTombstoneMarker> trie,
+                                  ContentManagerPojo.PojoSerializer<Object> pojoSerializer,
+                                  DataOutputPlus out) throws IOException
+    {
+        try (DataOutputBuffer trieBytes = new DataOutputBuffer())
+        {
+            DeletionAwareFileWriter.write(trie,
+                                          false,
+                                          contentSerializer(pojoSerializer),
+                                          deletionSerializer(pojoSerializer),
+                                          trieBytes);
+            ByteBufferUtil.writeWithVIntLength(trieBytes.asNewBuffer(), out);
+        }
+    }
+
+    /// The trie format keeps live content and deletion markers in separate branches, each with its
+    /// own serializer, while the payload codec is one type-tagged serializer over both. These adapt
+    /// the one to the other so the cell encoding stays in a single place.
+    private static FileWriter.DataSerializer<Object> contentSerializer(ContentManagerPojo.PojoSerializer<Object> pojo)
+    {
+        return new FileWriter.DataSerializer<Object>()
+        {
+            @Override
+            public int serializedSize(Object value)
+            {
+                return Ints.checkedCast(pojo.serializedSize(value));
+            }
+
+            @Override
+            public int serialize(DataOutputPlus out, Object value) throws IOException
+            {
+                pojo.serialize(value, out);
+                return serializedSize(value);
+            }
+        };
+    }
+
+    private static FileWriter.DataSerializer<TrieTombstoneMarker> deletionSerializer(ContentManagerPojo.PojoSerializer<Object> pojo)
+    {
+        return new FileWriter.DataSerializer<TrieTombstoneMarker>()
+        {
+            @Override
+            public int serializedSize(TrieTombstoneMarker value)
+            {
+                return Ints.checkedCast(pojo.serializedSize(value));
+            }
+
+            @Override
+            public int serialize(DataOutputPlus out, TrieTombstoneMarker value) throws IOException
+            {
+                pojo.serialize(value, out);
+                return serializedSize(value);
+            }
+        };
+    }
+
+    private static OnDiskCursor.DataDeserializer<Object> contentDeserializer(ContentManagerPojo.PojoSerializer<Object> pojo)
+    {
+        return (rdr, length) -> pojo.deserialize(rdr);
+    }
+
+    private static OnDiskCursor.DataDeserializer<TrieTombstoneMarker> deletionDeserializer(ContentManagerPojo.PojoSerializer<Object> pojo)
+    {
+        return (rdr, length) -> (TrieTombstoneMarker) pojo.deserialize(rdr);
     }
 
     /**
@@ -124,17 +198,18 @@ public class TriePartitionUpdateSerializer
 
         ContentManagerPojo.PojoSerializer<Object> pojoSerializer = createPojoSerializer(metadata, null, header, version, desHelper);
 
-        try
-        {
-            InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie =
-                InMemoryDeletionAwareTrie.deserialize(in, TrieBackedRow::shouldPreserveContentWithoutChildren, bufferType, InMemoryBaseTrie.ExpectedLifetime.SHORT, null, pojoSerializer);
+        // The trie is walked in place over these bytes rather than rebuilt, so the update holds a
+        // view over the buffer. TrieBackedPartition stores a DeletionAwareTrie, not specifically an
+        // in-memory one, which is what makes reading without materialising possible.
+        ByteBuffer trieBytes = ByteBufferUtil.readWithVIntLength(in);
+        DeletionAwareTrie<Object, TrieTombstoneMarker> trie =
+            OnDiskDeletionAwareTrie.open(trieBytes,
+                                         contentDeserializer(pojoSerializer),
+                                         deletionDeserializer(pojoSerializer),
+                                         TrieBackedPartition.BYTE_COMPARABLE_VERSION,
+                                         -1);
 
-            return new TriePartitionUpdate(metadata, key, header.columns(), header.stats(), rowCountIncludingStatic, tombstoneCount, dataSize, trie);
-        }
-        catch (TrieSpaceExhaustedException e)
-        {
-            throw new IOException("Trie space exhausted during deserialization", e);
-        }
+        return new TriePartitionUpdate(metadata, key, header.columns(), header.stats(), rowCountIncludingStatic, tombstoneCount, dataSize, trie);
     }
 
     /**
@@ -165,12 +240,25 @@ public class TriePartitionUpdateSerializer
         return size;
     }
 
+    /// Sizing the trie means writing it: [FileWriter] lays branches out and accounts their sizes as
+    /// it emits them, so unlike the previous format there is no cheap size to read off the
+    /// structure. A caller that then serializes therefore walks twice.
+    ///
+    /// This is not the hot path it looks like. [org.apache.cassandra.db.Mutation] already sizes a
+    /// mutation once and, below CACHEABLE_MUTATION_SIZE_LIMIT, caches the serialized bytes and
+    /// serves the write from them — so on the commit-log and messaging paths the second walk only
+    /// happens for mutations too large to cache.
     private static long serializedTrieSize(TriePartitionUpdate trieUpdate, ContentManagerPojo.PojoSerializer<Object> pojoSerializer)
     {
-        @SuppressWarnings("unchecked")
-        InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie =
-            (InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>) trieUpdate.trie();
-        return trie.serializedSize(pojoSerializer);
+        try (DataOutputBuffer trieBytes = new DataOutputBuffer())
+        {
+            DeletionAwareFileWriter.write(trieUpdate.trie(),
+                                          false,
+                                          contentSerializer(pojoSerializer),
+                                          deletionSerializer(pojoSerializer),
+                                          trieBytes);
+            return TypeSizes.sizeofWithVIntLength(trieBytes.asNewBuffer());
+        }
     }
 
     private static final ColumnMetadata[] EMPTY_COLS = new ColumnMetadata[0];
