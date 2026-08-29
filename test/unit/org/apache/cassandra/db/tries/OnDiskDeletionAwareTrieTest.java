@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Random;
 
 import org.junit.BeforeClass;
+import org.junit.Ignore;
 import org.junit.Test;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
@@ -142,6 +143,12 @@ public class OnDiskDeletionAwareTrieTest
         }
 
         assertRoundTripsInMemory(source);
+
+        // The same data with the deletion branch hoisted to the root. That is the only shape that fills both the
+        // descent and the ascent content slot of a node, which is where the on-disk payload order can be observed at
+        // all -- a swap of the two makes partition-level deletions vanish and leaves rows and range tombstones
+        // looking healthy. DataPoint.fromList(points) builds it below the root, so no other case here reaches it.
+        assertRoundTripsInMemory(DataPoint.fromList(points, false, true));
     }
 
     /// The same round trip without a file, which is how the commit log and messaging will use this:
@@ -157,6 +164,35 @@ public class OnDiskDeletionAwareTrieTest
                 OnDiskDeletionAwareTrie.open(buffer, LIVE, MARKER, VERSION, -1);
             assertTriesEqual(source, read);
             read.close();
+        }
+    }
+
+    /// [DeletionAwareFileWriter#write] takes an `isOrdered` flag and passes it to the [FileWriter] that lays out the
+    /// data trie, where it swaps which of a node's two content slots is the descent one. [OnDiskDeletionAwareTrie]
+    /// has no such flag: it builds the data cursor with `isOrdered = false` unconditionally, so a trie written with
+    /// the flag set is read with the sides the other way round. What comes back is not the trie that was written --
+    /// in the case below the read-back root does not report a deletion branch at all, so the deletions are silently
+    /// dropped and the rows they covered come back live.
+    ///
+    /// Both production call sites pass `false`, and no ordered in-memory deletion-aware trie exists to write from, so
+    /// nothing reaches this today; the parameter is a trap rather than a live defect. Ignored rather than removed
+    /// because the resolution is a decision, not a fix: either the flag is threaded through to the reader, or it is
+    /// dropped from the writer's signature.
+    @Ignore("The writer's isOrdered flag has no counterpart on the read side; see the comment above")
+    @Test
+    public void testOrderedWriteRoundTrips() throws IOException
+    {
+        InMemoryDeletionAwareTrie<LivePoint, DeletionMarker> source =
+            DataPoint.fromList(points(marker("aa", -1, 10), live("ab", 30), marker("ac", 10, -1), live("b", 31)));
+
+        try (DataOutputBuffer out = new DataOutputBuffer())
+        {
+            DeletionAwareFileWriter.write(source, true, LIVE, MARKER, out);
+            try (OnDiskDeletionAwareTrie<LivePoint, DeletionMarker> read =
+                     OnDiskDeletionAwareTrie.open(out.asNewBuffer(), LIVE, MARKER, VERSION, -1))
+            {
+                assertTriesEqual(source, read);
+            }
         }
     }
 
