@@ -128,10 +128,10 @@ public class TriePartitionUpdateSerializer
 
         try (DataOutputBuffer trieBytes = new DataOutputBuffer())
         {
-            DeletionAwareFileWriter.write(trieUpdate.trie(),
-                                          contentSerializer(pojoSerializer),
-                                          deletionSerializer(pojoSerializer),
-                                          trieBytes);
+            DeletionAwareFileWriter.writeUnpacked(trieUpdate.trie(),
+                                                  contentSerializer(pojoSerializer),
+                                                  deletionSerializer(pojoSerializer),
+                                                  trieBytes);
             // out.write copies the buffer synchronously and leaves its position alone, and nothing
             // touches trieBytes after this, so the trie does not have to be copied out first.
             ByteBufferUtil.writeWithVIntLength(trieBytes.unsafeGetBufferAndFlip(), out);
@@ -291,20 +291,22 @@ public class TriePartitionUpdateSerializer
         return size;
     }
 
-    /// Sizing the trie means writing it: [FileWriter] lays branches out and accounts their sizes as
-    /// it emits them, so unlike the previous format there is no cheap size to read off the
-    /// structure. The layout is therefore kept on the update, and [#writeTrie] writes it out
-    /// instead of building the same bytes a second time -- [org.apache.cassandra.db.Mutation]
-    /// sizes a mutation and then immediately serializes it, so the second build was the common
-    /// case rather than a rare one.
+    /// Sizing the trie means writing it: the size of a node depends on the distance to its children,
+    /// so unlike the previous format there is no cheap size to read off the structure. The bytes are
+    /// therefore kept on the update, and [#writeTrie] writes them out instead of building the same
+    /// ones a second time -- [org.apache.cassandra.db.Mutation] sizes a mutation and then immediately
+    /// serializes it, so the second build was the common case rather than a rare one.
+    ///
+    /// Must stay on the same writer as [#writeTrie]: the two layouts are not interchangeable, and the
+    /// size reserves the commit log region the write then fills.
     private static long serializedTrieSize(TriePartitionUpdate trieUpdate, ContentManagerPojo.PojoSerializer<Object> pojoSerializer, int version)
     {
         try (DataOutputBuffer trieBytes = new DataOutputBuffer())
         {
-            DeletionAwareFileWriter.write(trieUpdate.trie(),
-                                          contentSerializer(pojoSerializer),
-                                          deletionSerializer(pojoSerializer),
-                                          trieBytes);
+            DeletionAwareFileWriter.writeUnpacked(trieUpdate.trie(),
+                                                  contentSerializer(pojoSerializer),
+                                                  deletionSerializer(pojoSerializer),
+                                                  trieBytes);
             // Only the length is needed; asNewBuffer() would copy the whole trie out to report it.
             int trieLength = trieBytes.getLength();
             // The buffer is this method's own and a plain DataOutputBuffer recycles nothing on close, so the layout
