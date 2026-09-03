@@ -76,6 +76,10 @@ public class TriePartitionUpdateSerializer
     /// The largest trie layout [#serializedSize] will keep on the update for the write that follows it.
     private static final long RETAINED_TRIE_SIZE_LIMIT = CassandraRelevantProperties.CACHEABLE_MUTATION_SIZE_LIMIT.getLong();
 
+    /// Bounds on the estimate the trie layout buffer is sized from, see [#trieLayoutBuffer].
+    private static final int MIN_TRIE_LAYOUT_BUFFER_SIZE = 128;
+    private static final int MAX_TRIE_LAYOUT_BUFFER_SIZE = 1 << 20;
+
     private TriePartitionUpdateSerializer()
     {
     }
@@ -126,7 +130,7 @@ public class TriePartitionUpdateSerializer
             return;
         }
 
-        try (DataOutputBuffer trieBytes = new DataOutputBuffer())
+        try (DataOutputBuffer trieBytes = trieLayoutBuffer(trieUpdate))
         {
             DeletionAwareFileWriter.writeUnpacked(trieUpdate.trie(),
                                                   contentSerializer(pojoSerializer),
@@ -293,7 +297,7 @@ public class TriePartitionUpdateSerializer
     /// size reserves the commit log region the write then fills.
     private static long serializedTrieSize(TriePartitionUpdate trieUpdate, ContentManagerPojo.PojoSerializer<Object> pojoSerializer, int version)
     {
-        try (DataOutputBuffer trieBytes = new DataOutputBuffer())
+        try (DataOutputBuffer trieBytes = trieLayoutBuffer(trieUpdate))
         {
             DeletionAwareFileWriter.writeUnpacked(trieUpdate.trie(),
                                                   contentSerializer(pojoSerializer),
@@ -313,6 +317,26 @@ public class TriePartitionUpdateSerializer
             // is a failure to encode a payload, which the write path reports as IOException.
             throw new UncheckedIOException(e);
         }
+    }
+
+    /// A buffer to lay the trie out into, started at roughly the size the layout needs.
+    ///
+    /// [DataOutputBuffer]'s own default is 128 bytes, which all but the smallest updates outgrow, and every step
+    /// past it allocates a new buffer and copies into it everything written so far -- on a path
+    /// [org.apache.cassandra.db.Mutation#validateSize] takes for every write, not an occasional one. The update's
+    /// data size is already computed and is close enough to the length of the trie body to start from: a single-row
+    /// insert carrying a 100-byte blob reports 124 and lays out in 124 bytes. It is not exact in either direction --
+    /// the trie's own nodes and pointers are not in it, and an update made mostly of tombstones can lay out to
+    /// several times it -- so it is floored at the size a plain buffer would have started from anyway, and capped so
+    /// that an implausible value cannot turn into an outsized allocation. Past the cap the growth path takes over,
+    /// which is cheap next to laying out a trie that large.
+    ///
+    /// This is a capacity hint and nothing else: what the writer emits does not depend on how much room it is given,
+    /// so an estimate that falls short costs only the growth it was meant to save.
+    private static DataOutputBuffer trieLayoutBuffer(TriePartitionUpdate trieUpdate)
+    {
+        int estimate = Math.min(trieUpdate.dataSize(), MAX_TRIE_LAYOUT_BUFFER_SIZE);
+        return new DataOutputBuffer(Math.max(estimate, MIN_TRIE_LAYOUT_BUFFER_SIZE));
     }
 
     private static final ColumnMetadata[] EMPTY_COLS = new ColumnMetadata[0];
