@@ -112,7 +112,7 @@ public class UnpackedFileWriterTest
     @Test
     public void testSingleChildChainFold() throws Exception
     {
-        for (int length : FOLDABLE_CHAIN_LENGTHS)
+        for (int length : CHAIN_LENGTHS)
             testKeys("ab", "ab" + repeat('c', length));
     }
 
@@ -121,7 +121,7 @@ public class UnpackedFileWriterTest
     public void testSingleChildChainFoldWithAscentContent() throws Exception
     {
         Assume.assumeTrue(isOrdered);
-        for (int length : FOLDABLE_CHAIN_LENGTHS)
+        for (int length : CHAIN_LENGTHS)
             testKeys("ab~", "ab" + repeat('c', length));
     }
 
@@ -133,17 +133,13 @@ public class UnpackedFileWriterTest
         testKeys("ab", "abcde", "abfgh");     // two children
         testKeys("ab", "abc");                // single child, no chain to fold into
         testKeys("ab", "abc", "abcde");       // single child, itself a prefix node
-        // A chain that fills its shallowest node exactly, on an edge that cannot fold. The same chain under a fold
-        // is left out of the lists below: it makes the packed writer under-account the branch by the byte the extra
-        // chain node costs, and trip its own `pos <= expectedPos` assertion before it writes anything.
+        // A chain that fills its shallowest node exactly, on an edge that cannot fold; the foldable form of the
+        // same shape is covered by the tests above.
         for (int length : new int[]{ 64, 128 })
             testKeys("ab" + repeat('c', length + 1), "abd");
     }
 
     private static final int[] CHAIN_LENGTHS = { 1, 2, 3, 62, 63, 64, 65, 66, 127, 128, 129 };
-    /// [#CHAIN_LENGTHS] without the two that make a folded chain need one more chain node, which the packed writer
-    /// mis-sizes; see [#testNoFold].
-    private static final int[] FOLDABLE_CHAIN_LENGTHS = { 1, 2, 3, 62, 63, 64, 66, 127, 128 };
 
     @Test
     public void testSparse() throws Exception

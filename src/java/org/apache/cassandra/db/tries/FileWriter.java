@@ -469,7 +469,12 @@ public class FileWriter<T> extends TriePathReconstructor implements Cursor.Walke
         {
             assert writtenFilePos < 0;
             assert firstTransition != -1;
-            return new Node<>(-1, insertFirst(otherTransitions, firstTransition), children, descentPathContent, ascentPathContent, currentBranchSize + 1, branchSizeValidUntilPosition);
+            byte[] withPrefix = insertFirst(otherTransitions, firstTransition);
+            // The branch grows by the added byte, plus the code byte of one more chain node when the chain was an
+            // exact multiple of MAX_CHAIN_LENGTH_INCLUSIVE and the byte spills into a new node. The copy inherits the
+            // source's branchSizeValidUntilPosition, so the size may never be recomputed -- it must be right here.
+            long sizeIncrease = OnDiskWriteNodeType.sizeChain(withPrefix) - OnDiskWriteNodeType.sizeChain(otherTransitions);
+            return new Node<>(-1, withPrefix, children, descentPathContent, ascentPathContent, currentBranchSize + sizeIncrease, branchSizeValidUntilPosition);
         }
 
         private static byte[] insertFirst(byte[] transitions, int firstByte)
