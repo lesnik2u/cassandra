@@ -70,9 +70,12 @@ public class FileWriter<T> extends TriePathReconstructor implements Cursor.Walke
     int lastNodeOnPath = -1;
     boolean onAscentPath = false;
 
-    TreeSet<Node<T>> reusableTreeSet = new TreeSet<>();
-    Node<T> reusableBoundaryNode = Node.make(0, null, null, null, null);
-    NavigableSet<Node<T>> reusableHeadSet = reusableTreeSet.headSet(reusableBoundaryNode, true);
+    /// Working state of [#layoutChildren], which is the only thing that touches it. Created on first use, so
+    /// that a writer whose destination reports no page limit -- and which therefore never lays out pages -- does
+    /// not pay for it. The three are set up together by [#reusableTreeSet].
+    private TreeSet<Node<T>> reusableTreeSet;
+    private Node<T> reusableBoundaryNode;
+    private NavigableSet<Node<T>> reusableHeadSet;
 
     public FileWriter(DataOutputPlus out, DataSerializer<T> dataSerializer, boolean swapAscentAndDescentSides)
     {
@@ -124,7 +127,7 @@ public class FileWriter<T> extends TriePathReconstructor implements Cursor.Walke
         return addNewNode(keyPos);
     }
 
-    private InProgressNode<T> addNewNode(int depth)
+    InProgressNode<T> addNewNode(int depth)
     {
         if (++lastNodeOnPath >= nodesOnPath.length)
             nodesOnPath = Arrays.copyOf(nodesOnPath, lastNodeOnPath * 2);
@@ -216,7 +219,7 @@ public class FileWriter<T> extends TriePathReconstructor implements Cursor.Walke
             return writeWithPadding(completed, branchSize);
         }
 
-        TreeSet<Node<T>> orderedChildren = reusableTreeSet;
+        TreeSet<Node<T>> orderedChildren = reusableTreeSet();
         for (Node<T> child : completed.children)
         {
             if (child.writtenFilePos >= 0)
@@ -298,6 +301,17 @@ public class FileWriter<T> extends TriePathReconstructor implements Cursor.Walke
         return position;
     }
 
+    private TreeSet<Node<T>> reusableTreeSet()
+    {
+        if (reusableTreeSet == null)
+        {
+            reusableTreeSet = new TreeSet<>();
+            reusableBoundaryNode = Node.make(0, null, null, null, null);
+            reusableHeadSet = reusableTreeSet.headSet(reusableBoundaryNode, true);
+        }
+        return reusableTreeSet;
+    }
+
     private long writeWithPadding(Node<T> completed, long branchSize) throws IOException
     {
         // If using the remainder of the page splits the node in one more page than necessary, advance to a new page.
@@ -311,6 +325,13 @@ public class FileWriter<T> extends TriePathReconstructor implements Cursor.Walke
     public void onReturnPath()
     {
         onAscentPath = true;
+    }
+
+    /// Complete whatever the writer has left open in the stream, so that something else can be written into it.
+    /// [DeletionAwareFileWriter] does that when it starts a deletion branch. This writer emits nothing until the walk
+    /// ends, so it has nothing to close; [UnpackedFileWriter] may be holding back the closing byte of a chain.
+    void flushPendingChain() throws IOException
+    {
     }
 
     public DataOutputPlus complete()
@@ -359,7 +380,7 @@ public class FileWriter<T> extends TriePathReconstructor implements Cursor.Walke
         assert hasChildren || node.ascentPathContent != null || node.descentPathContent != null;
 
         if (hasChildren)    // TODO: if child contains a chain and we are making a new one, join them
-            writeChildrenOfNode(node);
+            writeChildren(node.children, node.childCount());
 
         if (node.ascentPathContent != null || node.descentPathContent != null)
             OnDiskWriteNodeType.writePayload(out, dataSerializer, node.descentPathContent, node.ascentPathContent, hasChildren);
@@ -370,17 +391,18 @@ public class FileWriter<T> extends TriePathReconstructor implements Cursor.Walke
         return node.finalizeWithPos(out.position());
     }
 
-    private void writeChildrenOfNode(Node<T> node) throws IOException
+    /// Write the children part of a node, given the first `size` entries of `children` as (transition, position)
+    /// pairs. All of them must already be written, or be about to be written immediately before this node.
+    void writeChildren(Node<?>[] children, int size) throws IOException
     {
-        int size = node.childCount();
         long basePos = out.position();
         long furthestChild = Long.MAX_VALUE;
-        for (Node<T> child : node.children)
-            furthestChild = Math.min(furthestChild, child.writtenFilePos);
+        for (int i = 0; i < size; ++i)
+            furthestChild = Math.min(furthestChild, children[i].writtenFilePos);
         assert furthestChild >= 0 && furthestChild <= basePos;
         int bytesPerPointer = bytesFor(basePos - furthestChild);
         OnDiskWriteNodeType type = OnDiskWriteNodeType.selectChildrenType(bytesPerPointer, size);
-        type.writeChildren(out, node.children, basePos, bytesPerPointer);
+        type.writeChildren(out, children, size, basePos, bytesPerPointer);
     }
 
     private long writeNodeRecursively(Node<T> node) throws IOException
@@ -598,8 +620,8 @@ public class FileWriter<T> extends TriePathReconstructor implements Cursor.Walke
         T descentPathContent;
         T ascentPathContent;
         /// Grown on demand by [#addChild]; a node can have up to 256 children, but the vast majority have very few.
-        private Node[] children = NO_CHILDREN;
-        private int childCount = 0;
+        Node[] children = NO_CHILDREN;
+        int childCount = 0;
 
         private Node<T> complete(int firstTransition, byte[] otherTransitions, boolean swapAscentAndDescentSides)
         {
@@ -627,6 +649,32 @@ public class FileWriter<T> extends TriePathReconstructor implements Cursor.Walke
             children[childCount++] = target;
         }
 
+        /// Record an already-written child as a (transition, position) pair, filling the slot's existing [Node] if
+        /// it has one. [UnpackedFileWriter] has nothing else to remember about a child, and reusing the holders is
+        /// what keeps it from allocating one per child; [#resetKeepingChildHolders] leaves them in place.
+        void addChild(int transition, long position)
+        {
+            if (childCount == children.length)
+                children = Arrays.copyOf(children, Math.max(4, childCount * 2));
+            Node<T> child = children[childCount];
+            if (child == null)
+                children[childCount] = child = Node.make(transition, null, null, null, null);
+            else
+                child.firstTransition = transition;
+            child.writtenFilePos = position;
+            ++childCount;
+        }
+
+        /// Clear the node for reuse, keeping the holders [#addChild(int, long)] filled. Safe only because that
+        /// form of `addChild` hands the holders to no one -- unlike [#complete], which passes the children on to
+        /// the completed node.
+        void resetKeepingChildHolders()
+        {
+            childCount = 0;
+            descentPathContent = null;
+            ascentPathContent = null;
+        }
+
         @Override
         public String toString()
         {
@@ -647,49 +695,54 @@ public class FileWriter<T> extends TriePathReconstructor implements Cursor.Walke
     {
         try (SequentialWriter writer = new SequentialWriter(file))
         {
-            FileWriter<T> fw = new FileWriter<>(writer, serializer, isOrdered);
+            write(trie, new FileWriter<>(writer, serializer, isOrdered));
+            writer.finish();
+            return file;
+        }
+    }
 
-            Cursor<T> c = trie.cursor(Direction.REVERSE);
-            T content = c.content();   // handle content on the root node
+    /// Walk `trie` in [Direction#REVERSE] -- so that the root ends up last and the trie is read from the end of the
+    /// stream -- feeding the given writer. Separate from [#write(BaseTrie, boolean, DataSerializer, File)] because
+    /// [UnpackedFileWriter] is driven by the same loop.
+    static <T> void write(BaseTrie<T, ?, ?> trie, FileWriter<T> fw) throws IOException
+    {
+        Cursor<T> c = trie.cursor(Direction.REVERSE);
+        T content = c.content();   // handle content on the root node
+        if (content != null)
+            fw.content(content);
+
+        long prevPosition = c.encodedPosition();
+        while (true)
+        {
+            long currPosition = c.advanceMultiple(fw);
+
+            if (Cursor.ascended(currPosition, prevPosition))
+            {
+                // write the nodes that have been completed
+                fw.ascendTo(currPosition);
+
+                if (Cursor.isExhausted(currPosition))
+                    return;
+
+                // update key tracker
+                int depth = Cursor.depth(currPosition);
+                if (depth > 0)
+                {
+                    fw.resetPathLength(depth - 1);
+                    fw.addPathByte(Cursor.incomingTransition(currPosition));
+                }
+            }
+            else
+                fw.addPathByte(Cursor.incomingTransition(currPosition));
+
+            if (Cursor.isOnReturnPath(currPosition))
+                fw.onReturnPath();
+
+            content = c.content();
             if (content != null)
                 fw.content(content);
 
-            long prevPosition = c.encodedPosition();
-            while (true)
-            {
-                long currPosition = c.advanceMultiple(fw);
-
-                if (Cursor.ascended(currPosition, prevPosition))
-                {
-                    // write the nodes that have been completed
-                    fw.ascendTo(currPosition);
-
-                    if (Cursor.isExhausted(currPosition))
-                    {
-                        writer.finish();
-                        return file;
-                    }
-
-                    // update key tracker
-                    int depth = Cursor.depth(currPosition);
-                    if (depth > 0)
-                    {
-                        fw.resetPathLength(depth - 1);
-                        fw.addPathByte(Cursor.incomingTransition(currPosition));
-                    }
-                }
-                else
-                    fw.addPathByte(Cursor.incomingTransition(currPosition));
-
-                if (Cursor.isOnReturnPath(currPosition))
-                    fw.onReturnPath();
-
-                content = c.content();
-                if (content != null)
-                    fw.content(content);
-
-                prevPosition = currPosition;
-            }
+            prevPosition = currPosition;
         }
     }
 }

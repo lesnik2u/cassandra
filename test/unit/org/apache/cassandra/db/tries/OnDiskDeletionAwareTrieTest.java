@@ -159,6 +159,19 @@ public class OnDiskDeletionAwareTrieTest
             assertTriesEqual(source, read);
             read.close();
         }
+
+        assertUnpackedRoundTrips(source);
+    }
+
+    /// The same trie written with [UnpackedFileWriter], which lays the deletion branches out differently -- see
+    /// [TrieUtil#writeUnpacked] -- and must still read back the same.
+    private void assertUnpackedRoundTrips(InMemoryDeletionAwareTrie<LivePoint, DeletionMarker> source)
+    {
+        byte[] bytes = TrieUtil.writeUnpacked(source, LIVE, MARKER);
+        OnDiskDeletionAwareTrie<LivePoint, DeletionMarker> read =
+            OnDiskDeletionAwareTrie.open(ByteBuffer.wrap(bytes), LIVE, MARKER, VERSION, -1);
+        assertTriesEqual(source, read);
+        read.close();
     }
 
     @Test
@@ -198,6 +211,7 @@ public class OnDiskDeletionAwareTrieTest
     {
         List<DataPoint> points = points(marker("abc", -1, 5), marker("abd", 5, -1), live("xyz", 3));
         InMemoryDeletionAwareTrie<LivePoint, DeletionMarker> source = DataPoint.fromList(points, false, true);
+        assertUnpackedRoundTrips(source);
         try (DataOutputBuffer out = new DataOutputBuffer())
         {
             DeletionAwareFileWriter.write(source, LIVE, MARKER, out);
@@ -369,6 +383,7 @@ public class OnDiskDeletionAwareTrieTest
     {
         List<DataPoint> points = largeMixedPoints(4000);
         InMemoryDeletionAwareTrie<LivePoint, DeletionMarker> source = DataPoint.fromList(points);
+        assertUnpackedRoundTrips(source);
 
         File file = new File(java.io.File.createTempFile("deletionawarelarge", ".trie"));
         try (SequentialWriter writer = new SequentialWriter(file))

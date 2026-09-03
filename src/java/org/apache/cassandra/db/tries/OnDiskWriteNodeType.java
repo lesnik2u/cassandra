@@ -42,9 +42,9 @@ public enum OnDiskWriteNodeType
         }
 
         @Override
-        void writeChildren(DataOutputPlus out, FileWriter.Node<?>[] children, long basePos, int bytesPerPointer) throws IOException
+        void writeChildren(DataOutputPlus out, FileWriter.Node<?>[] children, int size, long basePos, int bytesPerPointer) throws IOException
         {
-            assert children.length == 1;
+            assert size == 1;
             maybeWriteRelay(out, children, basePos, 1);
             // Node may have moved its transition into the leading chain of its child. If so, there's no node to write
             // here.
@@ -70,9 +70,8 @@ public enum OnDiskWriteNodeType
         }
 
         @Override
-        void writeChildren(DataOutputPlus out, FileWriter.Node<?>[] children, long basePos, int bytesPerPointer) throws IOException
+        void writeChildren(DataOutputPlus out, FileWriter.Node<?>[] children, int size, long basePos, int bytesPerPointer) throws IOException
         {
-            int size = children.length;
             // last pointer is not implicit here
             int index = size - 1;
             for (int i = 0; i <= 255; ++i)
@@ -97,9 +96,9 @@ public enum OnDiskWriteNodeType
         }
 
         @Override
-        void writeChildren(DataOutputPlus out, FileWriter.Node<?>[] children, long basePos, int bytesPerPointer) throws IOException
+        void writeChildren(DataOutputPlus out, FileWriter.Node<?>[] children, int size, long basePos, int bytesPerPointer) throws IOException
         {
-            int size = writePointers(out, children, basePos, bytesPerPointer);
+            writePointers(out, children, size, basePos, bytesPerPointer);
             BitSet bits = new BitSet(256);
             for (int i = 0; i < size; ++i)
                 bits.set(children[i].firstTransition);
@@ -123,9 +122,9 @@ public enum OnDiskWriteNodeType
         }
 
         @Override
-        void writeChildren(DataOutputPlus out, FileWriter.Node<?>[] children, long basePos, int bytesPerPointer) throws IOException
+        void writeChildren(DataOutputPlus out, FileWriter.Node<?>[] children, int size, long basePos, int bytesPerPointer) throws IOException
         {
-            int size = writePointers(out, children, basePos, bytesPerPointer);
+            writePointers(out, children, size, basePos, bytesPerPointer);
             for (int i = size - 1; i >= 0; --i)
                 out.writeByte(children[i].firstTransition);
             out.writeByte(bits | ((size - 2) << SHIFT_SPARSE_LENGTH) | (bytesPerPointer - 1));
@@ -235,7 +234,7 @@ public enum OnDiskWriteNodeType
         throw new AssertionError();
     }
 
-    void writeChildren(DataOutputPlus out, FileWriter.Node<?> children[], long base, int bytesPerPointer) throws IOException
+    void writeChildren(DataOutputPlus out, FileWriter.Node<?> children[], int size, long base, int bytesPerPointer) throws IOException
     {
         // Throw by default, only applies to RELAY, SPARSE, BITMAP and DENSE
         throw new AssertionError();
@@ -249,12 +248,20 @@ public enum OnDiskWriteNodeType
 
     static void writeChain(DataOutputPlus out, byte[] bytes) throws IOException
     {
-        int remaining = bytes.length;
-        int current = remaining - 1;
+        writeChain(out, bytes, 0, bytes.length);
+    }
+
+    /// Write the chain formed by `bytes[from, to)`, the deepest node first. The split is anchored at the deep end:
+    /// the deepest chain node takes the last [#MAX_CHAIN_LENGTH_INCLUSIVE] bytes of the range and any remainder
+    /// becomes the shallowest node.
+    static void writeChain(DataOutputPlus out, byte[] bytes, int from, int to) throws IOException
+    {
+        int remaining = to - from;
+        int current = to - 1;
         while (remaining > 0)
         {
             int len = Math.min(remaining, MAX_CHAIN_LENGTH_INCLUSIVE);
-            int stop = remaining - len;
+            int stop = from + remaining - len;
             while (current >= stop)
                 out.writeByte(bytes[current--]);
             out.writeByte(CHAIN.bits | (len - 1));
@@ -288,13 +295,11 @@ public enum OnDiskWriteNodeType
         return implicitFirstChild(children) ? 0 : sizeRelay(bytesPerPointer);
     }
 
-    static int writePointers(DataOutputPlus out, FileWriter.Node<?>[] children, long basePos, int bytesPerPointer) throws IOException
+    static void writePointers(DataOutputPlus out, FileWriter.Node<?>[] children, int size, long basePos, int bytesPerPointer) throws IOException
     {
-        int size = children.length;
         basePos = maybeWriteRelay(out, children, basePos, size);
         for (int i = size - 2; i >= 0; --i)
             FileWriter.writeReversedSized(out, basePos - children[i].writtenFilePos, bytesPerPointer);
-        return size;
     }
 
     private static long maybeWriteRelay(DataOutputPlus out, FileWriter.Node<?>[] children, long basePos, int size) throws IOException

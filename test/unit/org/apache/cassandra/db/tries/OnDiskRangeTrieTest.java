@@ -107,6 +107,7 @@ public class OnDiskRangeTrieTest
     private void testWideNode(int prefixLength, int[] transitions, int suffixLength) throws IOException
     {
         InMemoryRangeTrie<TestRangeState> expected = TestRangeState.fromList(markers(prefixLength, transitions, suffixLength));
+        TrieUtil.assertUnpackedWriterMatches(expected, true, RANGE_SERDE);
         File file = FileWriter.write(expected, true, RANGE_SERDE, new File(java.io.File.createTempFile("rangetrie", ".trie")));
 
         try (OnDiskRangeTrie<TestRangeState> actual = OnDiskRangeTrie.open(file, RANGE_SERDE, VERSION, -1))

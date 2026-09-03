@@ -48,6 +48,7 @@ import com.google.common.collect.Streams;
 import org.junit.Assert;
 
 import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -991,6 +992,7 @@ public class TrieUtil
     {
         try
         {
+            assertUnpackedWriterMatches(trie, isOrdered, serializer);
             File file = FileWriter.write(trie, isOrdered, serializer, new File(java.io.File.createTempFile("intersection", ".trie")));
             return OnDiskTrie.open(file, deserializer, VERSION,  isOrdered, -1);
         }
@@ -1009,6 +1011,7 @@ public class TrieUtil
     {
         try
         {
+            assertUnpackedWriterMatches(trie, true, serializer);
             File file = FileWriter.write(trie, true, serializer, new File(java.io.File.createTempFile("intersection", ".trie")));
             return OnDiskRangeTrie.open(file, deserializer, VERSION, -1);
         }
@@ -1016,6 +1019,57 @@ public class TrieUtil
         {
             throw new RuntimeException(e);
         }
+    }
+
+    /// Write the trie with both [FileWriter] and [UnpackedFileWriter] into buffers -- which report no page limit, so
+    /// the former does no page packing -- and assert the two agree byte for byte, which is the contract
+    /// [UnpackedFileWriter] is written to. Returns the bytes, so a caller can also read them back.
+    public static <T> byte[] assertUnpackedWriterMatches(BaseTrie<T, ?, ?> trie, boolean isOrdered, FileWriter.DataSerializer<T> serializer)
+    {
+        try (DataOutputBuffer packed = new DataOutputBuffer();
+             DataOutputBuffer unpacked = new DataOutputBuffer())
+        {
+            FileWriter.write(trie, new FileWriter<>(packed, serializer, isOrdered));
+            UnpackedFileWriter.write(trie, isOrdered, serializer, unpacked);
+            return assertSameBytes(packed, unpacked);
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /// Write a deletion-aware trie with [UnpackedFileWriter], for a caller that reads the result back.
+    ///
+    /// There is no byte comparison against [FileWriter] here, unlike the plain-trie form above: the two cannot
+    /// agree once a trie has more than one deletion branch. A deletion branch is written into the stream as the
+    /// walk leaves it, but [FileWriter] emits no data-trie node until the walk ends, so it produces every branch
+    /// first and the whole data trie after them, while the unpacked writer interleaves the two. Both layouts are
+    /// self-consistent -- every pointer still runs backwards -- and both read back the same trie.
+    public static <T, D extends RangeState<D>> byte[] writeUnpacked(DeletionAwareTrie<T, D> trie,
+                                                                    FileWriter.DataSerializer<T> contentSerializer,
+                                                                    FileWriter.DataSerializer<D> deletionSerializer)
+    {
+        try (DataOutputBuffer unpacked = new DataOutputBuffer())
+        {
+            DeletionAwareFileWriter.writeUnpacked(trie, contentSerializer, deletionSerializer, unpacked);
+            return unpacked.toByteArray();
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static byte[] assertSameBytes(DataOutputBuffer packed, DataOutputBuffer unpacked)
+    {
+        byte[] expected = packed.toByteArray();
+        byte[] actual = unpacked.toByteArray();
+        if (!Arrays.equals(expected, actual))
+            fail("Unpacked writer output differs from packed writer output." +
+                 "\nexpected " + Hex.bytesToHex(expected) +
+                 "\nactual   " + Hex.bytesToHex(actual));
+        return actual;
     }
 
     static class SpecStackEntry

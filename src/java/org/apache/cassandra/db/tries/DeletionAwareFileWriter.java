@@ -123,6 +123,9 @@ implements Cursor.Walker<T, DataOutputPlus>
     /// The writer for the data trie itself.
     final FileWriter<Slot<T>> inner;
 
+    /// Whether to write with [UnpackedFileWriter]; applies to the deletion branches as well as the data trie.
+    private final boolean unpacked;
+
     /// Non-null only while the walk is inside a deletion branch.
     private FileWriter<D> branchWriter;
     /// Depth of the node the current deletion branch hangs from, to rebase the nested walk.
@@ -136,12 +139,23 @@ implements Cursor.Walker<T, DataOutputPlus>
                                    FileWriter.DataSerializer<T> contentSerializer,
                                    FileWriter.DataSerializer<D> deletionSerializer)
     {
+        this(out, contentSerializer, deletionSerializer, false);
+    }
+
+    private DeletionAwareFileWriter(DataOutputPlus out,
+                                    FileWriter.DataSerializer<T> contentSerializer,
+                                    FileWriter.DataSerializer<D> deletionSerializer,
+                                    boolean unpacked)
+    {
         this.out = out;
         this.deletionSerializer = deletionSerializer;
+        this.unpacked = unpacked;
         // Never ordered: OnDiskDeletionAwareTrie always reads the data trie with isOrdered = false, and an ordered
         // write would swap the two content slots in FileWriter.InProgressNode.complete, putting the branch pointer
         // where the reader expects the live content.
-        this.inner = new FileWriter<>(out, new SlotSerializer<>(contentSerializer), false);
+        SlotSerializer<T> slotSerializer = new SlotSerializer<>(contentSerializer);
+        this.inner = unpacked ? new UnpackedFileWriter<>(out, slotSerializer, false)
+                              : new FileWriter<>(out, slotSerializer, false);
     }
 
     /// Write out every node the walk has finished with. Called by the driving loop on ascent,
@@ -162,8 +176,10 @@ implements Cursor.Walker<T, DataOutputPlus>
     /// Not [DeletionAwareCursor.DeletionAwareWalker]: that contract reports a branch's markers but
     /// never its ascents, and [FileWriter] only emits nodes on ascent. The driver below walks both
     /// levels explicitly instead, so these are plain methods rather than interface overrides.
-    public boolean enterDeletionsBranch()
+    public boolean enterDeletionsBranch() throws IOException
     {
+        // The branch's bytes go into the same stream, so the data trie must not have anything half-written in it.
+        inner.flushPendingChain();
         // Start a nested trie in the same stream. Its bytes land before the node that will
         // reference them, so the recorded root is a backward pointer like every other.
         //
@@ -171,7 +187,8 @@ implements Cursor.Walker<T, DataOutputPlus>
         // trie, it is read back through OnDiskCursor.Range, and that always reads with
         // isOrdered = true. Writing it unordered loses the ascent-path stops and the read-back
         // positions disagree on ON_RETURN_PATH_BIT.
-        branchWriter = new FileWriter<>(out, deletionSerializer, true);
+        branchWriter = unpacked ? new UnpackedFileWriter<>(out, deletionSerializer, true)
+                                : new FileWriter<>(out, deletionSerializer, true);
         branchStartPosition = out.position();
         branchDepthAdjustment = inner.keyPos;
         return true;
@@ -256,8 +273,33 @@ implements Cursor.Walker<T, DataOutputPlus>
                                                           FileWriter.DataSerializer<D> deletionSerializer,
                                                           DataOutputPlus out) throws IOException
     {
+        write(trie, contentSerializer, deletionSerializer, out, false);
+    }
+
+    /// Serialize a deletion-aware trie with [UnpackedFileWriter], for a destination that does not page.
+    ///
+    /// Unlike a plain trie's, the result is not the bytes [#write] produces once a trie has more than one deletion
+    /// branch. A branch goes into the stream as the walk leaves it, while [FileWriter] holds every data-trie node
+    /// back until the walk ends -- so it writes all the branches and then the whole data trie, where this
+    /// interleaves the two. Both layouts are read the same way: a branch is still written before the node that
+    /// points at it, so every pointer still runs backwards. A node whose last child is separated from it by a
+    /// branch does need a relay, which the packed layout never produces.
+    public static <T, D extends RangeState<D>> void writeUnpacked(DeletionAwareTrie<T, D> trie,
+                                                                  FileWriter.DataSerializer<T> contentSerializer,
+                                                                  FileWriter.DataSerializer<D> deletionSerializer,
+                                                                  DataOutputPlus out) throws IOException
+    {
+        write(trie, contentSerializer, deletionSerializer, out, true);
+    }
+
+    private static <T, D extends RangeState<D>> void write(DeletionAwareTrie<T, D> trie,
+                                                           FileWriter.DataSerializer<T> contentSerializer,
+                                                           FileWriter.DataSerializer<D> deletionSerializer,
+                                                           DataOutputPlus out,
+                                                           boolean unpacked) throws IOException
+    {
         DeletionAwareFileWriter<T, D> fw =
-            new DeletionAwareFileWriter<>(out, contentSerializer, deletionSerializer);
+            new DeletionAwareFileWriter<>(out, contentSerializer, deletionSerializer, unpacked);
         DeletionAwareCursor<T, D> c = trie.cursor(Direction.REVERSE);
 
         emitAt(fw, c);
