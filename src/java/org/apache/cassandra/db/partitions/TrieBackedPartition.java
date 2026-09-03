@@ -36,6 +36,7 @@ import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.Slice;
 import org.apache.cassandra.db.Slices;
 import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.ByteBufferAccessor;
 import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.RangeTombstoneMarker;
@@ -212,13 +213,22 @@ public class TrieBackedPartition implements Partition
 
     /// Put the given row in the trie, used by methods to build stand-alone partitions.
     ///
+    /// When nothing on either side needs a merge, the row's content is grafted with a recursive put, which for a
+    /// single-row update is much cheaper than constructing and running the general merge. The merge is used
+    /// otherwise; it is the only thing that can combine deletion branches and apply the deletions on each side to
+    /// the other side's content.
+    ///
     /// @param mutator    destination trie's mutator
     /// @param comparator for converting key to byte-comparable
     /// @param untypedRow content to put
-    protected static void putInTrie(InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>.Mutator<Object, TrieTombstoneMarker> mutator,
-                                    TableMetadata metadata,
-                                    ClusteringComparator comparator,
-                                    Row untypedRow)
+    /// @param canGraft   whether the caller has established that the destination trie holds no deletion, and that
+    ///                   the table's keys are short enough for a recursive descent (see [#canGraftRows])
+    /// @return whether the destination trie may hold a deletion after this call
+    protected static boolean putInTrie(InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>.Mutator<Object, TrieTombstoneMarker> mutator,
+                                       TableMetadata metadata,
+                                       ClusteringComparator comparator,
+                                       Row untypedRow,
+                                       boolean canGraft)
     {
         TrieBackedRow row;
         if (untypedRow instanceof TrieBackedRow)
@@ -230,12 +240,41 @@ public class TrieBackedPartition implements Partition
 
         try
         {
+            // The row must carry no deletion for the graft to be equivalent to the merge, and must not be empty:
+            // an empty row is only a liveness marker, which the merge drops as it has no children.
+            if (canGraft && !row.trie().hasDeletionBranchAtRoot() && !row.isEmpty())
+            {
+                mutator.putPrefixedRecursive(comparableClustering, row.trie().contentOnlyTrie());
+                return false;
+            }
+
             mutator.apply(row.trie().prefixedBySeparately(comparableClustering, true));
+            return true;
         }
         catch (TrieSpaceExhaustedException e)
         {
             throw new AssertionError(e);
         }
+    }
+
+    /// Whether rows of the given table may be grafted into a partition trie with a recursive put instead of a
+    /// merge, provided the destination holds no deletion. This bounds the depth of the recursion: the clustering
+    /// key must encode to a fixed, short number of bytes, and the table must have no complex columns, whose cell
+    /// paths are unbounded.
+    protected static boolean canGraftRows(TableMetadata metadata)
+    {
+        if (metadata.regularColumns().hasComplex() || metadata.staticColumns().hasComplex())
+            return false;
+
+        int length = 1; // terminator
+        for (AbstractType<?> type : metadata.comparator.subtypes())
+        {
+            if (!type.isValueLengthFixed())
+                return false;
+            length += 1 + type.valueLengthIfFixed();    // separator + value
+        }
+
+        return length <= TrieBackedRow.MAX_RECURSIVE_LENGTH;
     }
 
     protected static
@@ -738,6 +777,10 @@ public class TrieBackedPartition implements Partition
 
         private final boolean collectDataSize;
 
+        /// Whether rows can still be grafted with a recursive put, i.e. whether the trie is known to hold no
+        /// deletion. See [TrieBackedPartition#putInTrie].
+        private boolean canGraft;
+
         private int rowCountIncludingStatic;
         private int tombstoneCount;
         private long dataSize;
@@ -754,6 +797,7 @@ public class TrieBackedPartition implements Partition
             this.mutator = makeNoConflictMutator(this.trie);
 
             this.collectDataSize = collectDataSize;
+            this.canGraft = canGraftRows(metadata);
 
             rowCountIncludingStatic = 0;
             tombstoneCount = 0;
@@ -764,6 +808,7 @@ public class TrieBackedPartition implements Partition
             {
                 putPartitionDeletionInTrie(mutator, partitionLevelDeletion);
                 ++tombstoneCount;
+                canGraft = false;
             }
         }
 
@@ -777,7 +822,8 @@ public class TrieBackedPartition implements Partition
 
         public ContentBuilder addRow(Row row)
         {
-            putInTrie(mutator, metadata, comparator, row);
+            if (putInTrie(mutator, metadata, comparator, row, canGraft))
+                canGraft = false;
             ++rowCountIncludingStatic;
             if (collectDataSize)
                 dataSize += row.dataSize();
@@ -796,6 +842,7 @@ public class TrieBackedPartition implements Partition
                                        isReverseOrder ? unfiltered : openMarker,
                                        isReverseOrder ? openMarker : unfiltered);
                 ++tombstoneCount; // we only count one side of a range, to match DeletionInfo.rangeCount
+                canGraft = false;
                 if (unfiltered.isOpen(isReverseOrder))
                     openMarker = unfiltered;
                 else

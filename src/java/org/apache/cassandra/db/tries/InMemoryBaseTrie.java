@@ -1476,6 +1476,17 @@ public abstract class InMemoryBaseTrie<T, C extends Cursor<T>, Q extends BaseTri
             state.attachAndUpdateRoot(forcedCopyDepth);
         }
 
+        /// Graft the content of the given trie under the given prefix, resolving it with this mutator's data
+        /// transformer, as a faster alternative to running [#apply] over the prefixed trie.
+        ///
+        /// See [InMemoryBaseTrie#putPrefixedRecursive] for what this leaves out: deletion branches on either side,
+        /// content that would be dropped as a childless marker, and forced copying. The caller must establish that
+        /// none of these apply.
+        public void putPrefixedRecursive(ByteComparable prefix, Trie<U> branch) throws TrieSpaceExhaustedException
+        {
+            state.trie.putPrefixedRecursive(prefix, branch, transformer);
+        }
+
         @Override
         public boolean isBranching()
         {
@@ -1626,6 +1637,93 @@ public abstract class InMemoryBaseTrie<T, C extends Cursor<T>, Q extends BaseTri
                             : expandOrCreateChainNode(transition, newChild);
 
         return preservePrefix(node, skippedContent, attachedChild, false);
+    }
+
+    /// Graft the content of the given trie onto this one at the given prefix, using the same fast recursive
+    /// implementation as [#putRecursive]. May run into stack overflow if the combined length of the prefix and the
+    /// grafted trie's keys is too big.
+    ///
+    /// This only inserts content, resolving it with the given transformer as [#putRecursive] does. Unlike
+    /// [#apply] it does not process deletion branches on either side, and it does not drop content that becomes a
+    /// childless marker (see [ContentManager#shouldPreserveWithoutChildren]). It is the caller's responsibility to
+    /// establish that the merge would have nothing to do on these counts.
+    ///
+    /// @param prefix The trie path/key under which the content of `branch` is placed.
+    /// @param branch The trie whose content is to be added.
+    /// @param transformer A function applied to the potentially pre-existing value for each key of `branch`, and
+    /// that key's value, returning the final value that will stay in the trie. Applied even if there's no
+    /// pre-existing value in this trie.
+    public <R> void putPrefixedRecursive(ByteComparable prefix, Trie<R> branch, final UpsertTransformer<T, R> transformer) throws TrieSpaceExhaustedException
+    {
+        try
+        {
+            int newRoot = putPrefixedRecursive(root,
+                                               prefix.asComparableBytes(byteComparableVersion),
+                                               branch.cursor(Direction.FORWARD),
+                                               transformer);
+            if (newRoot != root)
+                root = newRoot;
+            completeMutation();
+        }
+        catch (Throwable t)
+        {
+            abortMutation();
+            throw t;
+        }
+    }
+
+    private <R> int putPrefixedRecursive(int node, ByteSource prefix, Cursor<R> branch, final UpsertTransformer<T, R> transformer) throws TrieSpaceExhaustedException
+    {
+        int transition = prefix.next();
+        if (transition == ByteSource.END_OF_STREAM)
+            return putBranchRecursive(node, branch, transformer);
+
+        int child = getChild(node, transition);
+
+        int newChild = putPrefixedRecursive(child, prefix, branch, transformer);
+        if (newChild == child)
+            return node;
+
+        int skippedContent = followPrefixTransition(node);
+        int attachedChild = !isNull(skippedContent)
+                            ? attachChild(skippedContent, transition, newChild)  // Single path, no copying required
+                            : expandOrCreateChainNode(transition, newChild);
+
+        return preservePrefix(node, skippedContent, attachedChild, false);
+    }
+
+    /// Copy the branch the cursor is positioned on into `node`, recursing through the branch's children. On return
+    /// the cursor is positioned on the first node that is not part of that branch.
+    private <R> int putBranchRecursive(int node, Cursor<R> branch, final UpsertTransformer<T, R> transformer) throws TrieSpaceExhaustedException
+    {
+        long position = branch.encodedPosition();
+        final int branchDepth = Cursor.depth(position);
+        if ((position & Cursor.MAY_HAVE_CONTENT_BIT) != 0)
+        {
+            R content = branch.content();
+            if (content != null)
+                node = applyContent(node, content, false, transformer);
+        }
+
+        position = branch.advance();
+        while (Cursor.depth(position) > branchDepth)
+        {
+            int transition = Cursor.incomingTransition(position);
+            int child = getChild(node, transition);
+
+            int newChild = putBranchRecursive(child, branch, transformer);
+            if (newChild != child)
+            {
+                int skippedContent = followPrefixTransition(node);
+                int attachedChild = !isNull(skippedContent)
+                                    ? attachChild(skippedContent, transition, newChild)
+                                    : expandOrCreateChainNode(transition, newChild);
+
+                node = preservePrefix(node, skippedContent, attachedChild, false);
+            }
+            position = branch.encodedPosition();
+        }
+        return node;
     }
 
     private <R> int applyContent(int node, R value, boolean contentAfterBranch, UpsertTransformer<T, R> transformer) throws TrieSpaceExhaustedException

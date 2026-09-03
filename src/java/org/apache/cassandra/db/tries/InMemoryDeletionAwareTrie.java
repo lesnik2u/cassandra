@@ -280,6 +280,12 @@ extends InMemoryBaseTrie<T, DeletionAwareCursor<T, D>, DeletionAwareTrie<T, D>> 
         return (D) getNodeContent(getAlternateBranch(root));
     }
 
+    @Override
+    public boolean hasDeletionBranchAtRoot()
+    {
+        return !isNull(getAlternateBranch(root));
+    }
+
     static class ApplyState<T, D extends RangeState<D>> extends InMemoryBaseTrie.ApplyState<T>
     {
         int alternateBranchToAttach;

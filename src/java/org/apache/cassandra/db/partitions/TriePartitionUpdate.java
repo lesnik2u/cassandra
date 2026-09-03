@@ -203,7 +203,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
         else
             columns = new RegularAndStaticColumns(Columns.NONE, Columns.from(row.columns()));
 
-        putInTrie(makeNoConflictMutator(trie), metadata, metadata.comparator, row);
+        putInTrie(makeNoConflictMutator(trie), metadata, metadata.comparator, row, canGraftRows(metadata));
 
         return new TriePartitionUpdate(metadata, key, columns, stats, 1, row.deletion().isLive() ? 0 : 1, row.dataSize(), row.columnCount(), trie);
     }
@@ -518,6 +518,9 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
         private final InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie = newTrieWithPartitionMarker();
         private final InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>.Mutator<Object, TrieTombstoneMarker> mutator;
         private final EncodingStats.Collector statsCollector = new EncodingStats.Collector();
+        /// Whether rows can still be grafted with a recursive put, i.e. whether the trie is known to hold no
+        /// deletion. See [TrieBackedPartition#putInTrie].
+        private boolean canGraft;
         /// Counts live rows (i.e. instances of LivenessInfo including EMPTY)
         private int rowCountIncludingStatic;
         /// Counts tombstone ranges and row deletions
@@ -534,6 +537,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
             this.metadata = metadata;
             this.key = key;
             this.columns = columns;
+            canGraft = canGraftRows(metadata);
             isBuilt = false;
             rowCountIncludingStatic = 0;
             tombstoneCount = 0;
@@ -561,13 +565,16 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
             if (row.isEmpty())
                 return;
 
-            putInTrie(mutator, metadata, metadata.comparator, row);
+            if (putInTrie(mutator, metadata, metadata.comparator, row, canGraft))
+                canGraft = false;
         }
 
         @Override
         public void addPartitionDeletion(DeletionTime deletionTime)
         {
             assertNotBuilt();
+            if (!deletionTime.isLive())
+                canGraft = false;
             putPartitionDeletionInTrie(mutator, deletionTime);
         }
 
@@ -575,6 +582,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
         public void add(RangeTombstone range)
         {
             assertNotBuilt();
+            canGraft = false;
             putRangeDeletionInTrie(mutator,
                                    metadata.comparator.asByteComparable(range.deletedSlice().start()),
                                    metadata.comparator.asByteComparable(range.deletedSlice().end()),
