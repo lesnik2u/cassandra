@@ -46,10 +46,10 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * From {@link MessagingService#VERSION_DS_21} on a trie-backed update can go out in either the BTree or the trie
- * encoding, the format byte saying which, and {@link PartitionUpdate.PartitionUpdateSerializer} writes whichever of
- * the two is smaller. These tests pin that choice down and, above all, that {@code serializedSize} describes the
- * bytes {@code serialize} then writes: the commit log reserves the region the first reports and the second fills it.
+ * From {@link MessagingService#VERSION_DS_21} on a trie-backed update is always written in the trie encoding, with
+ * format byte 1, whatever its shape and whatever the BTree encoding of it would have cost. These tests pin that down
+ * and, above all, that {@code serializedSize} describes the bytes {@code serialize} then writes: the commit log
+ * reserves the region the first reports and the second fills it.
  */
 public class PartitionUpdateFormatTest extends CQLTester
 {
@@ -64,7 +64,7 @@ public class PartitionUpdateFormatTest extends CQLTester
                     "s int static, ss set<text> static, PRIMARY KEY(k, c))");
     }
 
-    /** A table of the shape the write workload behind this choice uses: one row per partition, one blob column. */
+    /** A table of the shape a write workload uses: one row per partition, one blob column. */
     private void createBlobTable()
     {
         createTable("CREATE TABLE %s (k text, c int, v blob, PRIMARY KEY(k, c))");
@@ -116,88 +116,79 @@ public class PartitionUpdateFormatTest extends CQLTester
     }
 
     /**
-     * Every shape has to be written in the smaller of the two encodings, and the size reported for it has to be the
-     * number of bytes that then get written.
+     * Every shape has to be written in the trie encoding, and the size reported for it has to be the number of bytes
+     * that then get written.
      */
     @Test
-    public void testSmallerEncodingIsWrittenForEveryShape() throws Throwable
+    public void testTrieEncodingIsWrittenForEveryShape() throws Throwable
     {
         createRichTable();
         TableMetadata metadata = currentTableMetadata();
 
-        assertSmallerEncodingIsWritten("empty update",
-                                       () -> TriePartitionUpdate.asTrieUpdate(PartitionUpdate.emptyUpdate(metadata, metadata.partitioner.decorateKey(ByteBufferUtil.bytes("key0")))));
+        assertTrieEncodingIsWritten("empty update",
+                                    () -> TriePartitionUpdate.asTrieUpdate(PartitionUpdate.emptyUpdate(metadata, metadata.partitioner.decorateKey(ByteBufferUtil.bytes("key0")))));
 
-        assertSmallerEncodingIsWritten("one row", () -> build(builder -> {
+        assertTrieEncodingIsWritten("one row", () -> build(builder -> {
             builder.timestamp(2000).nowInSec(1500);
             builder.row(1).add("v", 11);
         }));
 
-        assertSmallerEncodingIsWritten("ten rows", () -> build(builder -> {
+        assertTrieEncodingIsWritten("ten rows", () -> build(builder -> {
             builder.timestamp(2000).nowInSec(1500);
             for (int i = 0; i < 10; ++i)
                 builder.row(i).add("v", i);
         }));
 
-        assertSmallerEncodingIsWritten("row with a ttl", () -> build(builder -> {
+        assertTrieEncodingIsWritten("row with a ttl", () -> build(builder -> {
             builder.timestamp(2000).nowInSec(1500).ttl(60);
             builder.row(1).add("v", 11);
         }));
 
-        assertSmallerEncodingIsWritten("range tombstone", () -> build(builder -> {
+        assertTrieEncodingIsWritten("range tombstone", () -> build(builder -> {
             builder.timestamp(2000).nowInSec(1500);
             builder.row(1).add("v", 11);
             builder.addRangeTombstone().start(5).end(9).inclStart().exclEnd();
         }));
 
-        assertSmallerEncodingIsWritten("complex columns", () -> build(builder -> {
+        assertTrieEncodingIsWritten("complex columns", () -> build(builder -> {
             builder.timestamp(2000).nowInSec(1500);
             builder.row().add("s", 7).add("ss", ImmutableSet.of("x", "y"));
             builder.row(1).add("m", ImmutableMap.of("a", "1", "b", "2"));
         }));
 
-        assertSmallerEncodingIsWritten("everything at once", this::richUpdate);
+        assertTrieEncodingIsWritten("everything at once", this::richUpdate);
 
         createSharedPrefixTable();
-        assertSmallerEncodingIsWritten("shared clustering prefixes", this::sharedPrefixUpdate);
+        assertTrieEncodingIsWritten("shared clustering prefixes", this::sharedPrefixUpdate);
 
         createBlobTable();
-        assertSmallerEncodingIsWritten("single row with a 100 byte blob", this::singleRowBlobUpdate);
+        assertTrieEncodingIsWritten("single row with a 100 byte blob", this::singleRowBlobUpdate);
     }
 
     /**
-     * The shape a write workload of single-row inserts produces, and the reason the choice exists: the trie's nodes
-     * and pointers are overhead a partition of one row has nothing to amortise them over, so the BTree encoding is
-     * the smaller one and the commit log should be getting it.
+     * The two shapes the encodings differ most on: a single row with a blob, where the trie's nodes and pointers are
+     * overhead a partition of one row has nothing to amortise them over and the trie encoding is the larger of the
+     * two, and clustering keys that share long prefixes, which the trie stores once and the BTree encoding repeats
+     * per row. Both go out in the trie format; the size comparison is recorded here, not decisive.
      */
     @Test
-    public void testSingleRowUpdateIsWrittenInTheBTreeFormat() throws Throwable
+    public void testTrieEncodingIsWrittenEvenWhereItIsTheLargerOne() throws Throwable
     {
         createBlobTable();
+        assertTrue("the trie encoding is expected to be the larger one for a single-row update",
+                   trieEncoded(singleRowBlobUpdate()).length > btreeEncoded(singleRowBlobUpdate()).length);
+        assertTrieEncodingIsWritten("single row with a 100 byte blob", this::singleRowBlobUpdate);
 
-        assertTrue("the BTree encoding is expected to be the smaller one for a single-row update",
-                   btreeEncoded(singleRowBlobUpdate()).length < trieEncoded(singleRowBlobUpdate()).length);
-        assertEquals(BTREE_FORMAT, assertSmallerEncodingIsWritten("single row with a 100 byte blob", this::singleRowBlobUpdate));
-    }
-
-    /**
-     * And the shape the trie encoding is there for: clustering keys that share long prefixes, which the trie stores
-     * once and the BTree encoding repeats per row.
-     */
-    @Test
-    public void testSharedClusteringPrefixesAreWrittenInTheTrieFormat() throws Throwable
-    {
         createSharedPrefixTable();
-
         assertTrue("the trie encoding is expected to be the smaller one when clustering keys share prefixes",
                    trieEncoded(sharedPrefixUpdate()).length < btreeEncoded(sharedPrefixUpdate()).length);
-        assertEquals(TRIE_FORMAT, assertSmallerEncodingIsWritten("shared clustering prefixes", this::sharedPrefixUpdate));
+        assertTrieEncodingIsWritten("shared clustering prefixes", this::sharedPrefixUpdate);
     }
 
     /**
-     * Sizing an update memoizes both encodings' sizes on it and lays its trie out, so the state a write starts from
-     * depends on whether a sizing ran first. The bytes must not: a write that makes the choice on its own has to
-     * write the same format and the same bytes as one that follows a sizing.
+     * Sizing an update memoizes its size on it and lays its trie out, so the state a write starts from depends on
+     * whether a sizing ran first. The bytes must not: a write that is not preceded by a sizing has to write the same
+     * format and the same bytes as one that follows a sizing.
      */
     @Test
     public void testSerializingWithoutSizingFirstWritesTheSameBytes() throws Throwable
@@ -209,8 +200,8 @@ public class PartitionUpdateFormatTest extends CQLTester
             builder.row(1).add("v", 11);
         }));
 
-        // One shape from either side of the choice: the layout a sizing retains is consumed by the write when the
-        // trie wins and dropped when it does not, and neither may change what gets written.
+        // The two shapes the encodings differ most on: the layout a sizing retains is consumed by the write in both,
+        // and consuming it may not change what gets written.
         createSharedPrefixTable();
         assertSameBytesWithAndWithoutSizingFirst("shared clustering prefixes", this::sharedPrefixUpdate);
 
@@ -219,9 +210,10 @@ public class PartitionUpdateFormatTest extends CQLTester
     }
 
     /**
-     * The BTree format is read back through the table's own partition update factory, so on a table that asks for a
-     * trie memtable an update written in either format has to come back trie-backed. Were that not so, choosing the
-     * smaller encoding would quietly hand the memtable a different kind of update.
+     * Nothing writes a format-0 body for a trie-backed update any more, but the read path still has to accept one:
+     * it can come from a peer or from a log written before the trie format existed. Either format has to come back
+     * trie-backed on a table that asks for a trie memtable, and with the content that was written: a format-0 body is
+     * built through the table's own partition update factory, a format-1 body by the trie serializer itself.
      */
     @Test
     public void testTrieBackedTableReadsBothFormatsBackAsTrieUpdates() throws Throwable
@@ -232,29 +224,28 @@ public class PartitionUpdateFormatTest extends CQLTester
             builder.timestamp(2000).nowInSec(1500);
             builder.row("c", "r").add("v", 1);
         });
-        assertEquals(BTREE_FORMAT, formatOf(singleRow, serialize(singleRow)));
-        assertTrue("an update written in the BTree format must read back trie-backed on a trie-backed table",
-                   deserialize(serialize(singleRow)) instanceof TriePartitionUpdate);
 
-        TriePartitionUpdate sharedPrefixes = sharedPrefixUpdate();
-        assertEquals(TRIE_FORMAT, formatOf(sharedPrefixes, serialize(sharedPrefixes)));
-        assertTrue(deserialize(serialize(sharedPrefixes)) instanceof TriePartitionUpdate);
+        byte[] btreeFormat = btreeFormatStream(singleRow);
+        assertEquals(BTREE_FORMAT, formatOf(singleRow, btreeFormat));
+        assertTrue("an update written in the BTree format must read back trie-backed on a trie-backed table",
+                   deserialize(btreeFormat) instanceof TriePartitionUpdate);
+        assertEquals(singleRow, TriePartitionUpdate.asTrieUpdate(deserialize(btreeFormat)));
+
+        byte[] written = serialize(singleRow);
+        assertEquals(TRIE_FORMAT, formatOf(singleRow, written));
+        assertTrue(deserialize(written) instanceof TriePartitionUpdate);
+        assertEquals(singleRow, TriePartitionUpdate.asTrieUpdate(deserialize(written)));
     }
 
     /**
      * Size the update the way the mutation path does, write it, and check that the size describes the bytes written,
-     * that the format byte is the smaller encoding's, that the body is that encoding's bytes, and that it reads back.
-     *
-     * @return the format byte that was written
+     * that the format byte is the trie encoding's, that the body is that encoding's bytes, and that it reads back.
      */
-    private byte assertSmallerEncodingIsWritten(String shape, Supplier<TriePartitionUpdate> updates) throws IOException
+    private void assertTrieEncodingIsWritten(String shape, Supplier<TriePartitionUpdate> updates) throws IOException
     {
-        // Measured on updates of their own: sizing one lays its trie out and memoizes, and the update that is
+        // Measured on an update of its own: sizing one lays its trie out and memoizes, and the update that is
         // written below must be in the state a freshly built one is in.
         byte[] trieEncoded = trieEncoded(updates.get());
-        byte[] btreeEncoded = btreeEncoded(updates.get());
-        boolean trieIsSmaller = trieEncoded.length <= btreeEncoded.length;
-        byte[] expectedBody = trieIsSmaller ? trieEncoded : btreeEncoded;
 
         TriePartitionUpdate update = updates.get();
         long size;
@@ -267,13 +258,12 @@ public class PartitionUpdateFormatTest extends CQLTester
         }
 
         assertEquals(shape + ": serializedSize must describe the bytes written", size, written.length);
-        assertEquals(shape + ": format byte", trieIsSmaller ? TRIE_FORMAT : BTREE_FORMAT, formatOf(update, written));
-        assertArrayEquals(shape + ": body must be the smaller encoding",
-                          expectedBody,
+        assertEquals(shape + ": format byte", TRIE_FORMAT, formatOf(update, written));
+        assertArrayEquals(shape + ": body must be the trie encoding",
+                          trieEncoded,
                           Arrays.copyOfRange(written, bodyOffset(update), written.length));
 
         assertEquals(shape + ": round trip", update, TriePartitionUpdate.asTrieUpdate(deserialize(written)));
-        return formatOf(update, written);
     }
 
     private void assertSameBytesWithAndWithoutSizingFirst(String shape, Supplier<TriePartitionUpdate> updates) throws IOException
@@ -305,6 +295,22 @@ public class PartitionUpdateFormatTest extends CQLTester
         try (DataOutputBuffer out = new DataOutputBuffer())
         {
             PartitionUpdate.serializer.serialize(update, out, VERSION);
+            return out.toByteArray();
+        }
+    }
+
+    /**
+     * What a sender that does not have the trie format, or a log written before it, leaves for the read path:
+     * the table id, a format byte of 0, and the update's BTree encoding. Assembled here because the writer no longer
+     * produces it for a trie-backed update.
+     */
+    private static byte[] btreeFormatStream(TriePartitionUpdate update) throws IOException
+    {
+        try (DataOutputBuffer out = new DataOutputBuffer())
+        {
+            update.metadata().id.serialize(out);
+            out.writeByte(BTREE_FORMAT);
+            out.write(btreeEncoded(update));
             return out.toByteArray();
         }
     }
