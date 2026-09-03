@@ -1543,6 +1543,25 @@ public abstract class InMemoryBaseTrie<T, C extends Cursor<T>, Q extends BaseTri
         }
     }
 
+    /// Place the given value at the root of a trie that is known to be empty.
+    ///
+    /// This is a shortcut for [#putRecursive] with an empty key: there are no key bytes to descend through and no
+    /// pre-existing content to resolve against, so the value can be handed to the content manager directly.
+    public void putRootContentInEmptyTrie(T value) throws TrieSpaceExhaustedException
+    {
+        assert isNull(root) : "putRootContentInEmptyTrie applied to a non-empty trie";
+        try
+        {
+            root = addContent(value, false);
+            completeMutation();
+        }
+        catch (Throwable t)
+        {
+            abortMutation();
+            throw t;
+        }
+    }
+
     /// Map-like put method, using a fast recursive implementation through the key bytes. May run into stack overflow if
     /// the trie becomes too deep. When the correct position in the trie has been reached, the value will be resolved
     /// with the given function before being placed in the trie (even if there's no pre-existing content in this trie).
