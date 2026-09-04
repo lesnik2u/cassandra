@@ -29,12 +29,14 @@ import org.apache.cassandra.db.Columns;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.LivenessInfo;
+import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.SerializationHeader;
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.db.marshal.ByteBufferAccessor;
 import org.apache.cassandra.db.rows.BTreeRow;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.DeserializationHelper;
+import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.RangeTombstoneMarker;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.SerializationHelper;
@@ -130,7 +132,7 @@ public class TriePartitionUpdateSerializer
             return;
         }
 
-        try (DataOutputBuffer trieBytes = trieLayoutBuffer(trieUpdate))
+        try (DataOutputBuffer trieBytes = trieLayoutBuffer(trieUpdate.dataSize()))
         {
             DeletionAwareFileWriter.writeUnpacked(trieUpdate.trie(),
                                                   contentSerializer(pojoSerializer),
@@ -142,14 +144,19 @@ public class TriePartitionUpdateSerializer
         }
     }
 
-    /// The trie [#serializedSize] laid out for this version, if it did, taken off the update so that it is not held
+    /// The trie already laid out for this version, if there is one, taken off the update so that it is not held
     /// any longer than the write that uses it.
+    ///
+    /// A layout the update is backed by is not taken: it is not a copy the write can consume but the store the
+    /// update reads its own content from, and it stays as long as the update does. That is also what makes the
+    /// layout run once per update rather than once per write, since every later write finds it still there.
     private static ByteBuffer takeRetainedTrie(TriePartitionUpdate trieUpdate, int version)
     {
         TriePartitionUpdate.SerializedTrie laidOut = trieUpdate.serializedTrie;
         if (laidOut == null || laidOut.version != version)
             return null;
-        trieUpdate.serializedTrie = null;
+        if (!laidOut.isBackingStore)
+            trieUpdate.serializedTrie = null;
         return laidOut.bytes;
     }
 
@@ -160,7 +167,7 @@ public class TriePartitionUpdateSerializer
     private static void retainTrie(TriePartitionUpdate trieUpdate, int version, ByteBuffer laidOut)
     {
         if (laidOut.remaining() < RETAINED_TRIE_SIZE_LIMIT)
-            trieUpdate.serializedTrie = new TriePartitionUpdate.SerializedTrie(version, laidOut);
+            trieUpdate.serializedTrie = new TriePartitionUpdate.SerializedTrie(version, laidOut, false);
     }
 
     /// The trie format keeps live content and deletion markers in separate branches, each with its
@@ -212,6 +219,60 @@ public class TriePartitionUpdateSerializer
     private static OnDiskCursor.DataDeserializer<TrieTombstoneMarker> deletionDeserializer(ContentManagerPojo.PojoSerializer<Object> pojo)
     {
         return (rdr, length) -> (TrieTombstoneMarker) pojo.deserialize(rdr);
+    }
+
+    /// A trie laid out in the on-disk encoding and the bytes it reads, held together because the trie is a view
+    /// over the buffer and is only usable for as long as the buffer is reachable.
+    static final class InBufferTrie
+    {
+        final ByteBuffer bytes;
+        final DeletionAwareTrie<Object, TrieTombstoneMarker> trie;
+
+        InBufferTrie(ByteBuffer bytes, DeletionAwareTrie<Object, TrieTombstoneMarker> trie)
+        {
+            this.bytes = bytes;
+            this.trie = trie;
+        }
+    }
+
+    /// Lays the given trie out in the on-disk encoding and returns a trie that reads it back in place, paired with
+    /// the bytes it reads. Same writer, same payload codec and same reader as the wire path, so what this produces
+    /// is byte-identical to what [#serialize] would have written for an update with these columns and stats, and
+    /// the layout can be handed to the write that follows as well as read from.
+    ///
+    /// @param dataSizeHint the update's data size, used only to size the layout buffer, see [#trieLayoutBuffer]
+    static InBufferTrie layOutInBuffer(TableMetadata metadata,
+                                       RegularAndStaticColumns columns,
+                                       EncodingStats stats,
+                                       DeletionAwareTrie<Object, TrieTombstoneMarker> trie,
+                                       int dataSizeHint,
+                                       int version) throws IOException
+    {
+        SerializationHeader header = new SerializationHeader(false, metadata, columns, stats);
+        ContentManagerPojo.PojoSerializer<Object> writeSerializer =
+            createPojoSerializer(metadata, new SerializationHelper(header), header, version, null);
+        ContentManagerPojo.PojoSerializer<Object> readSerializer =
+            createPojoSerializer(metadata, null, header, version,
+                                 new DeserializationHelper(metadata, version, DeserializationHelper.Flag.LOCAL));
+
+        ByteBuffer bytes;
+        try (DataOutputBuffer trieBytes = trieLayoutBuffer(dataSizeHint))
+        {
+            DeletionAwareFileWriter.writeUnpacked(trie,
+                                                  contentSerializer(writeSerializer),
+                                                  deletionSerializer(writeSerializer),
+                                                  trieBytes);
+            // The buffer is this method's own and a plain DataOutputBuffer recycles nothing on close, so the layout
+            // can be kept as it stands rather than copied out.
+            bytes = trieBytes.unsafeGetBufferAndFlip();
+        }
+
+        return new InBufferTrie(bytes,
+                                OnDiskDeletionAwareTrie.open(bytes,
+                                                             contentDeserializer(readSerializer),
+                                                             deletionDeserializer(readSerializer),
+                                                             TrieBackedPartition.BYTE_COMPARABLE_VERSION,
+                                                             -1));
     }
 
     /**
@@ -297,7 +358,17 @@ public class TriePartitionUpdateSerializer
     /// size reserves the commit log region the write then fills.
     private static long serializedTrieSize(TriePartitionUpdate trieUpdate, ContentManagerPojo.PojoSerializer<Object> pojoSerializer, int version)
     {
-        try (DataOutputBuffer trieBytes = trieLayoutBuffer(trieUpdate))
+        // A layout for this version may already be on the update -- most often because it is the store the update
+        // reads itself from, which [#writeTrie] will write as it stands. Its length is the answer; do not lay the
+        // trie out a second time to arrive at the same number, and do not replace the layout the write expects.
+        TriePartitionUpdate.SerializedTrie alreadyLaidOut = trieUpdate.serializedTrie;
+        if (alreadyLaidOut != null && alreadyLaidOut.version == version)
+        {
+            int trieLength = alreadyLaidOut.bytes.remaining();
+            return TypeSizes.sizeofUnsignedVInt(trieLength) + trieLength;
+        }
+
+        try (DataOutputBuffer trieBytes = trieLayoutBuffer(trieUpdate.dataSize()))
         {
             DeletionAwareFileWriter.writeUnpacked(trieUpdate.trie(),
                                                   contentSerializer(pojoSerializer),
@@ -333,9 +404,9 @@ public class TriePartitionUpdateSerializer
     ///
     /// This is a capacity hint and nothing else: what the writer emits does not depend on how much room it is given,
     /// so an estimate that falls short costs only the growth it was meant to save.
-    private static DataOutputBuffer trieLayoutBuffer(TriePartitionUpdate trieUpdate)
+    private static DataOutputBuffer trieLayoutBuffer(int dataSize)
     {
-        int estimate = Math.min(trieUpdate.dataSize(), MAX_TRIE_LAYOUT_BUFFER_SIZE);
+        int estimate = Math.min(dataSize, MAX_TRIE_LAYOUT_BUFFER_SIZE);
         return new DataOutputBuffer(Math.max(estimate, MIN_TRIE_LAYOUT_BUFFER_SIZE));
     }
 
