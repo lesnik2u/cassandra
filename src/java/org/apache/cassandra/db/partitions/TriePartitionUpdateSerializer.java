@@ -102,11 +102,8 @@ public class TriePartitionUpdateSerializer
 
         SerializationHeader header = new SerializationHeader(false, trieUpdate.metadata(), trieUpdate.columns(), trieUpdate.stats());
         SerializationHeader.serializer.serializeForMessaging(header, null, out, true);
-        SerializationHelper helper = new SerializationHelper(header);
 
-        ContentManagerPojo.PojoSerializer<Object> pojoSerializer = createPojoSerializer(trieUpdate.metadata(), helper, header, version, null);
-
-        writeTrie(trieUpdate, pojoSerializer, out, version);
+        writeTrie(trieUpdate, header, out, version);
     }
 
     /// Writes the trie in the on-disk trie format, length-prefixed.
@@ -120,8 +117,11 @@ public class TriePartitionUpdateSerializer
     /// instead of laying it out again, and the update stops holding them. Duplicated because the
     /// retained buffer can be written from more than one thread at a time and not every
     /// [DataOutputPlus] leaves the source's position alone.
+    ///
+    /// The payload serializer is only built where the trie is laid out: on the path that finds a layout it
+    /// encodes nothing, and building it is the fixed cost the layout is meant to save.
     private static void writeTrie(TriePartitionUpdate trieUpdate,
-                                  ContentManagerPojo.PojoSerializer<Object> pojoSerializer,
+                                  SerializationHeader header,
                                   DataOutputPlus out,
                                   int version) throws IOException
     {
@@ -132,6 +132,7 @@ public class TriePartitionUpdateSerializer
             return;
         }
 
+        ContentManagerPojo.PojoSerializer<Object> pojoSerializer = createWriteSerializer(trieUpdate.metadata(), header, version);
         try (DataOutputBuffer trieBytes = trieLayoutBuffer(trieUpdate.dataSize()))
         {
             DeletionAwareFileWriter.writeUnpacked(trieUpdate.trie(),
@@ -249,8 +250,7 @@ public class TriePartitionUpdateSerializer
                                        int version) throws IOException
     {
         SerializationHeader header = new SerializationHeader(false, metadata, columns, stats);
-        ContentManagerPojo.PojoSerializer<Object> writeSerializer =
-            createPojoSerializer(metadata, new SerializationHelper(header), header, version, null);
+        ContentManagerPojo.PojoSerializer<Object> writeSerializer = createWriteSerializer(metadata, header, version);
         ContentManagerPojo.PojoSerializer<Object> readSerializer =
             createPojoSerializer(metadata, null, header, version,
                                  new DeserializationHelper(metadata, version, DeserializationHelper.Flag.LOCAL));
@@ -330,15 +330,13 @@ public class TriePartitionUpdateSerializer
             return trieUpdate.serializedSizeDS20;
 
         SerializationHeader header = new SerializationHeader(false, trieUpdate.metadata(), trieUpdate.columns(), trieUpdate.stats());
-        SerializationHelper helper = new SerializationHelper(header);
-        ContentManagerPojo.PojoSerializer<Object> pojoSerializer = createPojoSerializer(trieUpdate.metadata(), helper, header, version, null);
 
         long size = ByteBufferUtil.serializedSizeWithVIntLength(trieUpdate.partitionKey().getKey())
                + TypeSizes.sizeofUnsignedVInt(trieUpdate.rowCountIncludingStatic)
                + TypeSizes.sizeofUnsignedVInt(trieUpdate.tombstoneCount)
                + TypeSizes.sizeofUnsignedVInt(trieUpdate.dataSize())
                + SerializationHeader.serializer.serializedSizeForMessaging(header, null, true)
-               + serializedTrieSize(trieUpdate, pojoSerializer, version);
+               + serializedTrieSize(trieUpdate, header, version);
 
         if (version == MessagingService.VERSION_DS_21)
             trieUpdate.serializedSizeDS21 = Ints.saturatedCast(size);
@@ -356,7 +354,7 @@ public class TriePartitionUpdateSerializer
     ///
     /// Must stay on the same writer as [#writeTrie]: the two layouts are not interchangeable, and the
     /// size reserves the commit log region the write then fills.
-    private static long serializedTrieSize(TriePartitionUpdate trieUpdate, ContentManagerPojo.PojoSerializer<Object> pojoSerializer, int version)
+    private static long serializedTrieSize(TriePartitionUpdate trieUpdate, SerializationHeader header, int version)
     {
         // A layout for this version may already be on the update -- most often because it is the store the update
         // reads itself from, which [#writeTrie] will write as it stands. Its length is the answer; do not lay the
@@ -368,6 +366,8 @@ public class TriePartitionUpdateSerializer
             return TypeSizes.sizeofUnsignedVInt(trieLength) + trieLength;
         }
 
+        // As in [#writeTrie], the payload serializer is only needed where the trie is laid out.
+        ContentManagerPojo.PojoSerializer<Object> pojoSerializer = createWriteSerializer(trieUpdate.metadata(), header, version);
         try (DataOutputBuffer trieBytes = trieLayoutBuffer(trieUpdate.dataSize()))
         {
             DeletionAwareFileWriter.writeUnpacked(trieUpdate.trie(),
@@ -436,6 +436,15 @@ public class TriePartitionUpdateSerializer
                 return i;
         }
         throw new IllegalArgumentException("Column not found in serialization header: " + col.name);
+    }
+
+    /// The payload serializer a trie is laid out with, together with the [SerializationHelper] it needs. Built
+    /// only where a layout is actually made: the paths that find one already on the update encode nothing.
+    private static ContentManagerPojo.PojoSerializer<Object> createWriteSerializer(TableMetadata metadata,
+                                                                                  SerializationHeader header,
+                                                                                  int version)
+    {
+        return createPojoSerializer(metadata, new SerializationHelper(header), header, version, null);
     }
 
     /**
