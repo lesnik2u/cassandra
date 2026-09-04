@@ -289,15 +289,14 @@ public class TriePartitionUpdateSerializerTest extends CQLTester
             builder.row(1).add("m", ImmutableMap.of("a", "1", "b", "2"));
         }));
 
-        // An update that carries a deletion and no live row does not read back: walking the deserialized trie
-        // repeats the deletion branch and then trips the return-path assertion in RangesCursor.tailCopyOf. That is
-        // a defect in the read path rather than in sizing, so only the sizing invariant is checked for these two.
-        assertSizeMatchesBytesWritten("range tombstone without rows", build(builder -> {
+        // An update that carries a deletion and no live row exhausts the walk on the deletion branch itself, which
+        // is the shape every schema mutation takes.
+        assertSizeAndRoundTrip("range tombstone without rows", build(builder -> {
             builder.timestamp(2000).nowInSec(1500);
             builder.addRangeTombstone().start(5).end(9).inclStart().exclEnd();
         }));
 
-        assertSizeMatchesBytesWritten("partition deletion", build(builder -> builder.timestamp(1000).nowInSec(1500).delete()));
+        assertSizeAndRoundTrip("partition deletion", build(builder -> builder.timestamp(1000).nowInSec(1500).delete()));
     }
 
     private TriePartitionUpdate build(Consumer<PartitionUpdate.SimpleBuilder> content)
@@ -334,10 +333,7 @@ public class TriePartitionUpdateSerializerTest extends CQLTester
      * was assembled in. What that produces must be the same update: the same content when it is read, and the same
      * bytes when it is written, since the layout the builder makes is the one the write path hands to the wire.
      *
-     * The shapes here are the ones {@link #testSerializedSizeMatchesBytesWrittenForEveryShape} round-trips. An
-     * update whose content under a clustering is a deletion and nothing else is left out for the same reason it is
-     * left out there: the on-disk read path cannot walk it yet, which is also why building in a buffer is off by
-     * default.
+     * The shapes here are the ones {@link #testSerializedSizeMatchesBytesWrittenForEveryShape} round-trips.
      */
     @Test
     public void testBuildingInBufferDescribesTheSameUpdate() throws Throwable
@@ -372,6 +368,13 @@ public class TriePartitionUpdateSerializerTest extends CQLTester
             builder.timestamp(2000).nowInSec(1500);
             builder.row(1).add("v", 11);
         });
+
+        assertSameWhenBuiltInBuffer("range tombstone without rows", builder -> {
+            builder.timestamp(2000).nowInSec(1500);
+            builder.addRangeTombstone().start(5).end(9).inclStart().exclEnd();
+        });
+
+        assertSameWhenBuiltInBuffer("partition deletion", builder -> builder.timestamp(1000).nowInSec(1500).delete());
     }
 
     private void assertSameWhenBuiltInBuffer(String shape, Consumer<PartitionUpdate.SimpleBuilder> content) throws IOException
