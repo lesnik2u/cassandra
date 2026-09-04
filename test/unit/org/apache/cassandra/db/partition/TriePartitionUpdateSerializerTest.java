@@ -34,6 +34,7 @@ import org.apache.cassandra.db.partitions.TriePartitionUpdate;
 import org.apache.cassandra.db.partitions.TriePartitionUpdateSerializer;
 import org.apache.cassandra.db.rows.DeserializationHelper;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.tries.InMemoryDeletionAwareTrie;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.net.MessagingService;
@@ -325,6 +326,93 @@ public class TriePartitionUpdateSerializerTest extends CQLTester
             PartitionUpdate.serializer.serialize(update, out, VERSION);
             assertEquals(shape, size, out.getLength());
             return out.toByteArray();
+        }
+    }
+
+    /**
+     * An update can be built straight into the on-disk encoding and backed by those bytes rather than by the trie it
+     * was assembled in. What that produces must be the same update: the same content when it is read, and the same
+     * bytes when it is written, since the layout the builder makes is the one the write path hands to the wire.
+     *
+     * The shapes here are the ones {@link #testSerializedSizeMatchesBytesWrittenForEveryShape} round-trips. An
+     * update whose content under a clustering is a deletion and nothing else is left out for the same reason it is
+     * left out there: the on-disk read path cannot walk it yet, which is also why building in a buffer is off by
+     * default.
+     */
+    @Test
+    public void testBuildingInBufferDescribesTheSameUpdate() throws Throwable
+    {
+        createRichTable();
+
+        assertSameWhenBuiltInBuffer("one row", builder -> {
+            builder.timestamp(2000).nowInSec(1500);
+            builder.row(1).add("v", 11);
+        });
+
+        assertSameWhenBuiltInBuffer("ten rows", builder -> {
+            builder.timestamp(2000).nowInSec(1500);
+            for (int i = 0; i < 10; ++i)
+                builder.row(i).add("v", i);
+        });
+
+        assertSameWhenBuiltInBuffer("complex columns", builder -> {
+            builder.timestamp(2000).nowInSec(1500);
+            builder.row().add("s", 7).add("ss", ImmutableSet.of("x", "y"));
+            builder.row(1).add("m", ImmutableMap.of("a", "1", "b", "2"));
+        });
+
+        assertSameWhenBuiltInBuffer("range tombstone", builder -> {
+            builder.timestamp(2000).nowInSec(1500);
+            builder.row(1).add("v", 11);
+            builder.addRangeTombstone().start(5).end(9).inclStart().exclEnd();
+        });
+
+        assertSameWhenBuiltInBuffer("partition deletion and a row", builder -> {
+            builder.timestamp(1000).nowInSec(1500).delete();
+            builder.timestamp(2000).nowInSec(1500);
+            builder.row(1).add("v", 11);
+        });
+    }
+
+    private void assertSameWhenBuiltInBuffer(String shape, Consumer<PartitionUpdate.SimpleBuilder> content) throws IOException
+    {
+        TriePartitionUpdate inMemory = buildWithInBuffer(content, false);
+        TriePartitionUpdate inBuffer = buildWithInBuffer(content, true);
+
+        // The two arms must not collapse into each other, or everything below passes for the wrong reason.
+        assertTrue(shape, inMemory.trie() instanceof InMemoryDeletionAwareTrie);
+        assertFalse(shape, inBuffer.trie() instanceof InMemoryDeletionAwareTrie);
+
+        assertEquals(shape, inMemory.columns(), inBuffer.columns());
+        assertEquals(shape, inMemory.stats(), inBuffer.stats());
+        assertEquals(shape, inMemory.dataSize(), inBuffer.dataSize());
+        assertEquals(shape, inMemory.rowCount(), inBuffer.rowCount());
+        assertEquals(shape, inMemory.operationCount(), inBuffer.operationCount());
+        assertEquals(shape, inMemory.deletionInfo(), inBuffer.deletionInfo());
+        assertEquals(shape, inMemory.staticRow(), inBuffer.staticRow());
+        assertEquals(shape, inMemory, inBuffer);
+
+        assertArrayEquals(shape, serialize(inMemory), serialize(inBuffer));
+        assertEquals(shape, inMemory, deserialize(serialize(inBuffer)));
+
+        // The layout the update is backed by is not handed over to the write that finds it, so sizing and writing
+        // the same update a second time must still describe the same bytes.
+        byte[] expected = assertSizeMatchesBytesWritten(shape, inMemory);
+        assertArrayEquals(shape, expected, assertSizeMatchesBytesWritten(shape, inBuffer));
+        assertArrayEquals(shape, expected, assertSizeMatchesBytesWritten(shape, inBuffer));
+    }
+
+    private TriePartitionUpdate buildWithInBuffer(Consumer<PartitionUpdate.SimpleBuilder> content, boolean inBuffer)
+    {
+        boolean previous = TriePartitionUpdate.IN_BUFFER_ON_BUILD;
+        TriePartitionUpdate.IN_BUFFER_ON_BUILD = inBuffer;
+        try
+        {
+            return build(content);
+        }
+        finally
+        {
+            TriePartitionUpdate.IN_BUFFER_ON_BUILD = previous;
         }
     }
 

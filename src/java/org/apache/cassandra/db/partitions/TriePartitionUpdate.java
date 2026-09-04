@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.db.partitions;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.EnumSet;
@@ -33,6 +34,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import net.openhft.chronicle.values.NotNull;
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.db.Columns;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionInfo;
@@ -58,8 +60,10 @@ import org.apache.cassandra.db.tries.DeletionAwareTrie;
 import org.apache.cassandra.db.tries.Direction;
 import org.apache.cassandra.db.tries.InMemoryDeletionAwareTrie;
 import org.apache.cassandra.db.tries.TrieSpaceExhaustedException;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 import org.apache.cassandra.utils.bytecomparable.ByteSource;
 
@@ -75,6 +79,14 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
     protected static final Logger logger = LoggerFactory.getLogger(TriePartitionUpdate.class);
 
     public static final Factory FACTORY = new TrieFactory();
+
+    /// Whether [Builder#build] lays the assembled trie out in the on-disk encoding and backs the update with those
+    /// bytes, instead of handing it the trie it was assembled in. Volatile and not final so that a microbenchmark
+    /// can measure both in one JVM; production reads it once per build and never writes it.
+    ///
+    /// Off by default, see
+    /// [org.apache.cassandra.config.CassandraRelevantProperties#TRIE_PARTITION_UPDATE_IN_BUFFER].
+    public static volatile boolean IN_BUFFER_ON_BUILD = CassandraRelevantProperties.TRIE_PARTITION_UPDATE_IN_BUFFER.getBoolean();
 
     private static EnumSet<TrieTombstoneMarker.Kind> ROW_DELETION_KINDS =
         EnumSet.of(TrieTombstoneMarker.Kind.ROW, TrieTombstoneMarker.Kind.RANGE, TrieTombstoneMarker.Kind.PARTITION);
@@ -370,7 +382,15 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
     @Override
     public long unsharedHeapSize()
     {
-        assert trie instanceof InMemoryDeletionAwareTrie;
+        if (!(trie instanceof InMemoryDeletionAwareTrie))
+        {
+            // A trie laid out in the on-disk encoding is a view over one buffer, and rows and cells are decoded from
+            // it on demand rather than held, so that buffer is the update's whole footprint. An update read off the
+            // wire does not keep the record and charges nothing here: it reads the message's bytes, not its own.
+            SerializedTrie laidOut = serializedTrie;
+            return laidOut != null ? ObjectSizes.sizeOnHeapOf(laidOut.bytes) : 0;
+        }
+
         InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> inMemoryTrie = (InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>) trie;
         class Collector implements DeletionAwareTrie.ValueConsumer<Object, TrieTombstoneMarker>
         {
@@ -465,6 +485,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
                               path != null ? TrieBackedRow.cellPathKey(column, path, v) : ByteSource.EMPTY);
         try
         {
+            // Safe: a counter table's update is never laid out in a buffer at build, exactly because of this cast.
             ((InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>) trie).apply(
                 DeletionAwareTrie.<ByteBuffer, TrieTombstoneMarker>singleton(key, BYTE_COMPARABLE_VERSION, value),
                 (c, v) -> ((Cell) c).withUpdatedValue(v),
@@ -491,6 +512,9 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
                 columnSet.add(column.column());
 
         RegularAndStaticColumns columns = RegularAndStaticColumns.builder().addAll(columnSet).build();
+        // The trie is carried over as it is, but a layout of it is not: cells are written as indexes into the
+        // header's columns, and the header these narrower columns produce is not the one the bytes were laid out
+        // against. The new update lays itself out when it is first sized.
         return new TriePartitionUpdate(metadata,
                                        partitionKey,
                                        columns,
@@ -498,7 +522,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
                                        rowCountIncludingStatic,
                                        tombstoneCount,
                                        dataSize,
-                                       (InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>) trie);
+                                       trie);
     }
 
     /// Returns true iff the given marker has a row-level deletion on its right side.
@@ -612,15 +636,64 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
         {
             assertNotBuilt();
             isBuilt = true;
+            EncodingStats stats = statsCollector.get();
+            int size = Ints.saturatedCast(dataSize);
+
+            // A counter update is mutated in place after it is built, by setCounterMarkValue, which needs the
+            // in-memory trie; everything else is only read from here on.
+            if (IN_BUFFER_ON_BUILD && !metadata.isCounter())
+            {
+                TriePartitionUpdate inBuffer = buildInBuffer(stats, size);
+                if (inBuffer != null)
+                    return inBuffer;
+            }
+
             return new TriePartitionUpdate(metadata,
                                            partitionKey(),
                                            columns,
-                                           statsCollector.get(),
+                                           stats,
                                            rowCountIncludingStatic,
                                            tombstoneCount,
-                                           Ints.saturatedCast(dataSize),
+                                           size,
                                            cellCount,
                                            trie);
+        }
+
+        /// Lays the assembled trie out in the on-disk encoding and returns an update that reads those bytes, or null
+        /// if the layout failed, in which case the caller keeps the in-memory trie.
+        ///
+        /// The update ends up holding one buffer instead of the node buffers the trie was assembled in, and the
+        /// layout every write of it needs has already been done: the bytes are recorded as laid out for
+        /// [MessagingService#current_version], which is the version the commit log and local replicas use, and
+        /// unlike a layout kept only for the next write they are not taken away by the write that finds them.
+        ///
+        /// A failure here is not fatal: the only way to it is a payload that cannot be encoded, which the write path
+        /// would report the same way, so falling back leaves that report where it already was.
+        private TriePartitionUpdate buildInBuffer(EncodingStats stats, int size)
+        {
+            int version = MessagingService.current_version;
+            try
+            {
+                TriePartitionUpdateSerializer.InBufferTrie laidOut =
+                    TriePartitionUpdateSerializer.layOutInBuffer(metadata, columns, stats, trie, size, version);
+                TriePartitionUpdate update = new TriePartitionUpdate(metadata,
+                                                                     partitionKey(),
+                                                                     columns,
+                                                                     stats,
+                                                                     rowCountIncludingStatic,
+                                                                     tombstoneCount,
+                                                                     size,
+                                                                     cellCount,
+                                                                     laidOut.trie);
+                update.serializedTrie = new SerializedTrie(version, laidOut.bytes, true);
+                return update;
+            }
+            catch (IOException e)
+            {
+                logger.warn("Could not lay out a partition update of {} in a buffer; keeping the in-memory trie.",
+                            metadata, e);
+                return null;
+            }
         }
 
         /** Merge in live data from the update trie. This can be various markers, liveness info or cells. */
