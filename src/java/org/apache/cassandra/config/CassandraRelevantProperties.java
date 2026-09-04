@@ -1129,13 +1129,11 @@ public enum CassandraRelevantProperties
      * Whether a trie-backed partition update is laid out in the on-disk trie encoding when it is built, and backed
      * by those bytes, instead of holding the in-memory trie it was assembled in.
      * <p>
-     * Off until the on-disk deletion-aware read path can walk an update whose content under a clustering is a
-     * deletion and nothing else -- a row deletion with no cells, or a range tombstone with no rows -- which today
-     * repeats the deletion branch and trips the return-path assertion in
-     * {@code org.apache.cassandra.db.tries.RangesCursor#tailCopyOf}. That is the same defect an update carrying
-     * such a shape already hits when it is read back off the wire.
+     * This is the layout the write path hands to the commit log and to messaging, so building it once at the point
+     * the update is assembled saves laying it out again for every serialization. Set to false to keep the update on
+     * the trie it was assembled in.
      */
-    TRIE_PARTITION_UPDATE_IN_BUFFER("cassandra.trie_partition_update.in_buffer_on_build", "false"),
+    TRIE_PARTITION_UPDATE_IN_BUFFER("cassandra.trie_partition_update.in_buffer_on_build", "true"),
 
     TRIGGERS_DIR("cassandra.triggers_dir"),
     TRUNCATE_BALLOT_METADATA("cassandra.truncate_ballot_metadata"),

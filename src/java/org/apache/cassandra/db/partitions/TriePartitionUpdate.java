@@ -84,7 +84,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
     /// bytes, instead of handing it the trie it was assembled in. Volatile and not final so that a microbenchmark
     /// can measure both in one JVM; production reads it once per build and never writes it.
     ///
-    /// Off by default, see
+    /// On by default, see
     /// [org.apache.cassandra.config.CassandraRelevantProperties#TRIE_PARTITION_UPDATE_IN_BUFFER].
     public static volatile boolean IN_BUFFER_ON_BUILD = CassandraRelevantProperties.TRIE_PARTITION_UPDATE_IN_BUFFER.getBoolean();
 
