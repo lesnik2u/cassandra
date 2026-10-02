@@ -189,7 +189,8 @@ public abstract class MemtablePool
 
         void released(long size)
         {
-            assert size >= 0 : "Negative released: " + size;
+            if (size < 0)
+                AccountingViolations.negativeRelease(this, size);
             adjustAllocated(-size);
             hasRoom.signalAll();
         }
@@ -219,6 +220,12 @@ public abstract class MemtablePool
         public long getReclaiming()
         {
             return reclaiming;
+        }
+
+        // how accounting reports name this sub-pool
+        String name()
+        {
+            return this == onHeap ? "on-heap" : "off-heap";
         }
 
         public float reclaimingRatio()

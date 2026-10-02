@@ -41,6 +41,7 @@ import org.apache.cassandra.metrics.CassandraMetricsRegistry;
 import org.apache.cassandra.metrics.ThreadPoolMetrics;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.memory.ResourceAccountingCheck;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
@@ -147,6 +148,7 @@ public final class ExecutorLivenessWatchdog
 
     private static ScheduledExecutorPlus executor;   // guarded by the class
     private static ExecutorLivenessWatchdog watchdog;   // guarded by the class; the one running on executor
+    private static ResourceAccountingCheck accountingCheck;   // guarded by the class; the one on executor, if any
 
     private final Supplier<? extends Iterable<Pool>> pools;
     final long checkIntervalNanos;
@@ -220,7 +222,11 @@ public final class ExecutorLivenessWatchdog
 
     /**
      * Starts the watchdog on its own executor, unless it is disabled or already running. The configuration is read
-     * here, once; if it is invalid, the watchdog logs why and stays stopped.
+     * here, once; if it is invalid, the watchdog logs why and stays stopped. A running watchdog also runs
+     * {@link ResourceAccountingCheck} on that executor, which {@link ResourceAccountingCheck#schedule} configures.
+     * That check initialises the memtable pool, the buffer pools and the chunk cache here, on the calling thread, if
+     * nothing has yet, which fixes their configuration, so start the watchdog only once the memtable and cache
+     * configuration is final; before {@code DatabaseDescriptor} is daemon- or tool-initialised, the check is skipped.
      */
     public static synchronized void start()
     {
@@ -257,6 +263,23 @@ public final class ExecutorLivenessWatchdog
                     "queued threshold {}ms, report interval {}ms; excluded pools: {}",
                     checkIntervalMillis, runningThresholdMillis, queuedThresholdMillis, reportIntervalMillis,
                     excludedPools);
+        // the watchdog runs from here on, whatever happens to the accounting check
+        try
+        {
+            accountingCheck = ResourceAccountingCheck.schedule(newExecutor, checkIntervalNanos,
+                                                               newWatchdog.reportIntervalNanos);
+        }
+        catch (Throwable t)
+        {
+            // logged first, and inspected only once the node's configuration is loaded, as the inspection reads it;
+            // before that, a VirtualMachineError is still rethrown rather than left as a WARN
+            logger.warn("Resource accounting check failed to start; the executor liveness watchdog runs without it",
+                        t);
+            if (ResourceAccountingCheck.nodeConfigurationLoaded())
+                JVMStabilityInspector.inspectThrowable(t);
+            else if (t instanceof VirtualMachineError)
+                throw (VirtualMachineError) t;
+        }
     }
 
     /** Stops the watchdog if it is running. */
@@ -267,6 +290,7 @@ public final class ExecutorLivenessWatchdog
         executor.shutdownNow();
         executor = null;
         watchdog = null;
+        accountingCheck = null;
     }
 
     @VisibleForTesting
@@ -285,6 +309,12 @@ public final class ExecutorLivenessWatchdog
     static synchronized ExecutorLivenessWatchdog watchdog()
     {
         return watchdog;
+    }
+
+    @VisibleForTesting
+    static synchronized ResourceAccountingCheck accountingCheck()
+    {
+        return accountingCheck;
     }
 
     /**

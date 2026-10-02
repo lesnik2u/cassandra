@@ -346,6 +346,22 @@ public class BufferPool
     }
 
     /**
+     * @return pooled buffer size being used, excluding unpooled buffers
+     */
+    long pooledMemoryInUseInBytes()
+    {
+        return memoryInUse.longValue();
+    }
+
+    /**
+     * @return allocated buffer pool slab size, excluding unpooled buffers
+     */
+    long pooledMemoryAllocatedInBytes()
+    {
+        return memoryAllocated.get();
+    }
+
+    /**
      * @return maximum pooled buffer size in bytes
      */
     public long memoryUsageThreshold()

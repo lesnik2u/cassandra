@@ -836,6 +836,29 @@ public enum CassandraRelevantProperties
      * Whether we reset any found data from previously run bootstraps.
      */
     RESET_BOOTSTRAP_PROGRESS("cassandra.reset_bootstrap_progress"),
+    /**
+     * How many consecutive checks a drift invariant of
+     * {@link org.apache.cassandra.utils.memory.ResourceAccountingCheck} must fail before it is reported; at least
+     * {@link #RESOURCE_ACCOUNTING_CHECK_PERSIST_CHECKS}. A drift, such as
+     * the chunk cache's buffer pool holding far more than the cache, can be true for a while in a correct node, so it
+     * is reported only once it lasts: by default, 55 s after the first check that sees it, as the 1st and the 12th
+     * check are 55 s apart at the default check interval of 5 s.
+     */
+    RESOURCE_ACCOUNTING_CHECK_DRIFT_CHECKS("cassandra.resource_accounting_check.drift_checks", "12"),
+    /**
+     * Whether {@link org.apache.cassandra.concurrent.ExecutorLivenessWatchdog} also runs
+     * {@link org.apache.cassandra.utils.memory.ResourceAccountingCheck}, which logs an error when the memtable pool's
+     * or the buffer pools' accounting is in an impossible state, or a warning when it has drifted, using the watchdog's
+     * check and report intervals. It runs only when the watchdog does.
+     */
+    RESOURCE_ACCOUNTING_CHECK_ENABLED("cassandra.resource_accounting_check.enabled", "true"),
+    /**
+     * How many consecutive checks an impossible-state invariant of
+     * {@link org.apache.cassandra.utils.memory.ResourceAccountingCheck} must fail before it is reported; at least 2,
+     * as two counters updated one after the other can be read in between, so that a single check can see an
+     * impossible state that a correct node passes through.
+     */
+    RESOURCE_ACCOUNTING_CHECK_PERSIST_CHECKS("cassandra.resource_accounting_check.persist_checks", "2"),
     RING_DELAY("cassandra.ring_delay_ms"),
     /** How often a role's password can be changed */
     ROLE_PASSWORD_UPDATE_MIN_INTERVAL_MS("cassandra.role_password_update_min_interval_in_ms", "5000"),
