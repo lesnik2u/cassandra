@@ -50,9 +50,9 @@ public class ChecksummedDataInput extends RebufferingInputStream
     protected long bufferOffset;
     protected final ChannelProxy channel;
 
-    ChecksummedDataInput(ChannelProxy channel, BufferType bufferType)
+    ChecksummedDataInput(ChannelProxy channel, ByteBuffer buffer)
     {
-        super(bufferType.allocate(RandomAccessReader.DEFAULT_BUFFER_SIZE));
+        super(buffer);
 
         crc = new CRC32();
         crcPosition = 0;
@@ -66,7 +66,7 @@ public class ChecksummedDataInput extends RebufferingInputStream
 
     ChecksummedDataInput(ChannelProxy channel)
     {
-        this(channel, BufferType.OFF_HEAP);
+        this(channel, BufferType.OFF_HEAP.allocate(RandomAccessReader.DEFAULT_BUFFER_SIZE));
     }
 
     public static ChecksummedDataInput open(File file)
@@ -240,8 +240,23 @@ public class ChecksummedDataInput extends RebufferingInputStream
     @Override
     public void close()
     {
+        try
+        {
+            releaseBuffer();
+        }
+        finally
+        {
+            channel.close();
+        }
+    }
+
+    /**
+     * Releases {@link #buffer}. Called from {@link #close()}, and must tolerate being called again. Subclasses that
+     * supply their own buffer, e.g. from a buffer pool, must override this to return it to where it came from.
+     */
+    protected void releaseBuffer()
+    {
         FileUtils.clean(buffer);
-        channel.close();
     }
 
     protected File getFile()

@@ -20,12 +20,14 @@ package org.apache.cassandra.hints;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.Objects;
 
 import com.google.common.annotations.VisibleForTesting;
 
 import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.compress.ICompressor;
 import org.apache.cassandra.io.util.ChannelProxy;
+import org.apache.cassandra.io.util.RandomAccessReader;
 import org.apache.cassandra.utils.memory.BufferPool;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.memory.BufferPools;
@@ -40,9 +42,11 @@ public final class CompressedChecksummedDataInput extends ChecksummedDataInput
     private volatile ByteBuffer compressedBuffer = null;
     private final ByteBuffer metadataBuffer = ByteBuffer.allocate(CompressedHintsWriter.METADATA_SIZE);
 
-    public CompressedChecksummedDataInput(ChannelProxy channel, ICompressor compressor, long filePosition)
+    // Takes ownership of buffer, which upgradeInput took from bufferPool. buffer and compressedBuffer always come from
+    // bufferPool, so they must always be returned to it.
+    private CompressedChecksummedDataInput(ChannelProxy channel, ByteBuffer buffer, ICompressor compressor, long filePosition)
     {
-        super(channel, compressor.preferredBufferType());
+        super(channel, buffer);
         this.compressor = compressor;
         this.sourcePosition = this.filePosition = filePosition;
     }
@@ -118,11 +122,14 @@ public final class CompressedChecksummedDataInput extends ChecksummedDataInput
         if (compressedBuffer == null || compressedSize > compressedBuffer.capacity())
         {
             int bufferSize = compressedSize + (compressedSize / 20);  // allocate +5% to cover variability in compressed size
-            if (compressedBuffer != null)
-            {
-                bufferPool.put(compressedBuffer);
-            }
+            // take the new buffer before returning the old one, so that if get() throws we still own the old one and
+            // close() returns it exactly once
+            ByteBuffer oldCompressedBuffer = compressedBuffer;
             compressedBuffer = bufferPool.get(bufferSize, compressor.preferredBufferType());
+            if (oldCompressedBuffer != null)
+            {
+                bufferPool.put(oldCompressedBuffer);
+            }
         }
 
         compressedBuffer.clear();
@@ -134,8 +141,10 @@ public final class CompressedChecksummedDataInput extends ChecksummedDataInput
         if (buffer.capacity() < uncompressedSize)
         {
             int bufferSize = uncompressedSize + (uncompressedSize / 20);
-            bufferPool.put(buffer);
+            // as for compressedBuffer, take the new buffer before returning the old one
+            ByteBuffer oldBuffer = buffer;
             buffer = bufferPool.get(bufferSize, compressor.preferredBufferType());
+            bufferPool.put(oldBuffer);
         }
 
         buffer.clear();
@@ -151,11 +160,28 @@ public final class CompressedChecksummedDataInput extends ChecksummedDataInput
         }
     }
 
+    /**
+     * Returns {@link #buffer} and {@link #compressedBuffer} to {@link #bufferPool}, and nulls them, so that calling this
+     * again cannot return a buffer the pool may have handed to someone else since. compressedBuffer is null until the
+     * first block is read.
+     */
     @Override
-    public void close()
+    protected void releaseBuffer()
     {
-        bufferPool.put(compressedBuffer);
-        super.close();
+        ByteBuffer released = buffer;
+        ByteBuffer releasedCompressed = compressedBuffer;
+        buffer = null;
+        compressedBuffer = null;
+        try
+        {
+            if (released != null)
+                bufferPool.put(released);
+        }
+        finally
+        {
+            if (releasedCompressed != null)
+                bufferPool.put(releasedCompressed);
+        }
     }
 
     public static ChecksummedDataInput upgradeInput(ChecksummedDataInput input, ICompressor compressor)
@@ -166,7 +192,23 @@ public final class CompressedChecksummedDataInput extends ChecksummedDataInput
         ChannelProxy channel = new ChannelProxy(input.getFile());
         try
         {
-            return new CompressedChecksummedDataInput(channel, compressor, position);
+            ByteBuffer buffer = bufferPool.get(RandomAccessReader.DEFAULT_BUFFER_SIZE, compressor.preferredBufferType());
+            try
+            {
+                return new CompressedChecksummedDataInput(channel, buffer, compressor, position);
+            }
+            catch (Throwable t)
+            {
+                try
+                {
+                    bufferPool.put(buffer);
+                }
+                catch (Throwable t2)
+                {
+                    t.addSuppressed(t2);
+                }
+                throw t;
+            }
         }
         catch (Throwable t)
         {
@@ -178,5 +220,17 @@ public final class CompressedChecksummedDataInput extends ChecksummedDataInput
     ICompressor getCompressor()
     {
         return compressor;
+    }
+
+    @VisibleForTesting
+    int bufferCapacity()
+    {
+        return Objects.requireNonNull(buffer, "the reader is closed").capacity();
+    }
+
+    @VisibleForTesting
+    int compressedBufferCapacity()
+    {
+        return Objects.requireNonNull(compressedBuffer, "no block has been read, or the reader is closed").capacity();
     }
 }
