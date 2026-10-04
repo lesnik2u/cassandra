@@ -149,6 +149,7 @@ public class BufferPool
 
     /**
      * Size of unpooled buffer being allocated outside of buffer pool in bytes.
+     * Only changed by allocate (+size) and put (-capacity), as the capacity of an unpooled buffer is never modified.
      */
     private final LongAdder overflowMemoryUsage = new LongAdder();
 
@@ -947,16 +948,12 @@ public class BufferPool
         {
             Chunk chunk = Chunk.getParentChunk(buffer);
             int originalCapacity = buffer.capacity();
-            int size = originalCapacity - buffer.limit();
 
             if (chunk == null)
-            {
-                updateOverflowMemoryUsage(-size);
                 return;
-            }
 
             chunk.freeUnusedPortion(buffer);
-            // Calculate the actual freed bytes which may be different from `size` when pooling is involved
+            // The actual freed bytes may differ from (originalCapacity - limit) when pooling is involved
             memoryInUse.add(buffer.capacity() - originalCapacity);
         }
 

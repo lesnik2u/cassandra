@@ -1050,6 +1050,89 @@ public class BufferPoolTest
         assertEquals(0, bufferPool.usedSizeInBytes());
     }
 
+    @Test
+    public void testPuttingUnusedPortionOfOverflowBuffer()
+    {
+        int macroChunkSize = BufferPool.GlobalPool.MACRO_CHUNK_SIZE;
+        int allocationSize = BufferPool.NORMAL_CHUNK_SIZE;
+        int allocations = macroChunkSize / allocationSize;
+        int trimmedSize = BufferPool.NORMAL_ALLOCATION_UNIT;
+
+        // occupy entire buffer pool
+        List<ByteBuffer> buffers = new ArrayList<>();
+        allocate(allocations, allocationSize, buffers);
+
+        assertEquals(macroChunkSize, bufferPool.usedSizeInBytes());
+        assertEquals(0, bufferPool.overflowMemoryInBytes());
+
+        // allocate overflow due to pool exhaust
+        ByteBuffer overflowBuffer = bufferPool.getAtLeast(allocationSize / 2, BufferType.OFF_HEAP);
+        int overflowCapacity = overflowBuffer.capacity();
+        assertNull(BufferPool.Chunk.getParentChunk(overflowBuffer));
+        assertEquals(macroChunkSize + overflowCapacity, bufferPool.sizeInBytes());
+        assertEquals(macroChunkSize + overflowCapacity, bufferPool.usedSizeInBytes());
+        assertEquals(overflowCapacity, bufferPool.overflowMemoryInBytes());
+
+        // an unpooled buffer cannot be partially freed, so trimming it changes nothing
+        overflowBuffer.limit(trimmedSize);
+        bufferPool.putUnusedPortion(overflowBuffer);
+
+        assertEquals(overflowCapacity, overflowBuffer.capacity());
+        assertEquals(macroChunkSize + overflowCapacity, bufferPool.sizeInBytes());
+        assertEquals(macroChunkSize + overflowCapacity, bufferPool.usedSizeInBytes());
+        assertEquals(overflowCapacity, bufferPool.overflowMemoryInBytes());
+
+        // returning it releases its full capacity
+        bufferPool.put(overflowBuffer);
+
+        assertEquals(macroChunkSize, bufferPool.sizeInBytes());
+        assertEquals(macroChunkSize, bufferPool.usedSizeInBytes());
+        assertEquals(0, bufferPool.overflowMemoryInBytes());
+
+        // trimming a pooled buffer returns its unused portion to the pool and leaves the overflow alone
+        ByteBuffer pooledBuffer = buffers.get(0);
+        assertNotNull(BufferPool.Chunk.getParentChunk(pooledBuffer));
+        pooledBuffer.limit(trimmedSize);
+        bufferPool.putUnusedPortion(pooledBuffer);
+
+        assertEquals(trimmedSize, pooledBuffer.capacity());
+        assertEquals(macroChunkSize - allocationSize + trimmedSize, bufferPool.usedSizeInBytes());
+        assertEquals(0, bufferPool.overflowMemoryInBytes());
+
+        release(buffers);
+
+        assertEquals(0, bufferPool.usedSizeInBytes());
+        assertEquals(0, bufferPool.overflowMemoryInBytes());
+    }
+
+    @Test
+    public void testPuttingUnusedPortionOfOversizedBuffer()
+    {
+        int trimmedSize = BufferPool.NORMAL_ALLOCATION_UNIT;
+
+        // a request over the chunk size is always allocated outside of the pool
+        ByteBuffer overflowBuffer = bufferPool.getAtLeast(BufferPool.NORMAL_CHUNK_SIZE + 1, BufferType.OFF_HEAP);
+        int overflowCapacity = overflowBuffer.capacity();
+        assertNull(BufferPool.Chunk.getParentChunk(overflowBuffer));
+        assertEquals(overflowCapacity, bufferPool.sizeInBytes());
+        assertEquals(overflowCapacity, bufferPool.usedSizeInBytes());
+        assertEquals(overflowCapacity, bufferPool.overflowMemoryInBytes());
+
+        overflowBuffer.limit(trimmedSize);
+        bufferPool.putUnusedPortion(overflowBuffer);
+
+        assertEquals(overflowCapacity, overflowBuffer.capacity());
+        assertEquals(overflowCapacity, bufferPool.sizeInBytes());
+        assertEquals(overflowCapacity, bufferPool.usedSizeInBytes());
+        assertEquals(overflowCapacity, bufferPool.overflowMemoryInBytes());
+
+        bufferPool.put(overflowBuffer);
+
+        assertEquals(0, bufferPool.sizeInBytes());
+        assertEquals(0, bufferPool.usedSizeInBytes());
+        assertEquals(0, bufferPool.overflowMemoryInBytes());
+    }
+
     private BufferPool.Chunk allocate(int num, int bufferSize, List<ByteBuffer> buffers)
     {
         for (int i = 0; i < num; i++)
