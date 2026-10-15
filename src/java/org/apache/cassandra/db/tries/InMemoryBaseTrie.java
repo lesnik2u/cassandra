@@ -891,8 +891,13 @@ public abstract class InMemoryBaseTrie<T> extends InMemoryReadTrie<T>
     static class ApplyState<T>
     {
         static final int STATE_SIZE = 5;
+        /// The number of levels to allocate space for on the first descent. Deeper tries grow the stack as needed.
+        static final int INITIAL_DEPTH = 16;
+        private static final int[] EMPTY_DATA = new int[0];
 
-        int[] data = new int[16 * STATE_SIZE];
+        /// Allocated on the first descent rather than on construction, because many short-lived tries are only ever
+        /// modified with [InMemoryBaseTrie#putRecursive] and never need it.
+        int[] data = EMPTY_DATA;
         int currentDepth = -1;
 
         Consumer<? super T> droppedContentCallback = null;
@@ -1078,7 +1083,7 @@ public abstract class InMemoryBaseTrie<T> extends InMemoryReadTrie<T>
         {
             ++currentDepth;
             if (currentDepth * STATE_SIZE >= data.length)
-                data = Arrays.copyOf(data, currentDepth * STATE_SIZE * 2);
+                growData();
             setExistingFullNode(existingFullNode);
 
             int existingContentId = NONE;
@@ -1100,6 +1105,12 @@ public abstract class InMemoryBaseTrie<T> extends InMemoryReadTrie<T>
             setUpdatedPostContentNode(existingPostContentNode);
             setDescentPathContentId(existingContentId);
             setTransition(-1);
+        }
+
+        /// Make room for the stack entry at `currentDepth`. Kept out of [#descendInto] to keep the descent path small.
+        private void growData()
+        {
+            data = Arrays.copyOf(data, Math.max(currentDepth * 2, INITIAL_DEPTH) * STATE_SIZE);
         }
 
         T getDescentPathContent()

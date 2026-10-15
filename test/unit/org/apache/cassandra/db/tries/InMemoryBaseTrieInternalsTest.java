@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import com.google.common.base.Predicates;
 import com.google.common.collect.Collections2;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -443,5 +444,77 @@ public class InMemoryBaseTrieInternalsTest
                          Integer.MAX_VALUE, trie.getNextTransition(node, 0x100));
             assertEquals(InMemoryReadTrie.NONE, trie.getNextChild(node, 0x100));
         }
+    }
+
+    @Test
+    public void testApplyStateAllocatedOnFirstDescent() throws TrieSpaceExhaustedException
+    {
+        // Short-lived tries are often only filled with putRecursive; the apply stack should not be allocated until a
+        // mutation descends into the trie.
+        InMemoryTrie<String>.Mutator<String> mutator = trie.mutator((x, y) -> y, Predicates.alwaysFalse());
+        assertEquals(0, mutator.state.data.length);
+        trie.putRecursive(ByteComparable.preencoded(ByteComparable.Version.OSS50, new byte[]{ 1, 2, 3 }), "r", (x, y) -> y);
+        assertEquals(0, mutator.state.data.length);
+        mutator.apply(Trie.singleton(ByteComparable.preencoded(ByteComparable.Version.OSS50, new byte[]{ 1, 2 }), ByteComparable.Version.OSS50, "a"));
+        assertEquals(InMemoryBaseTrie.ApplyState.INITIAL_DEPTH * InMemoryBaseTrie.ApplyState.STATE_SIZE, mutator.state.data.length);
+
+        InMemoryDeletionAwareTrie<LivePoint, DeletionMarker> daTrie = InMemoryDeletionAwareTrie.shortLived(TrieUtil.VERSION);
+        var daMutator = daTrie.mutator(DataPoint::combineLive,
+                                       DataPoint::combineDeletion,
+                                       DataPoint::deleteLive,
+                                       DataPoint::deleteLive,
+                                       false,
+                                       v -> false);
+        assertEquals(0, daMutator.state.data.length);
+        assertEquals(0, daTrie.deletionState.data.length);
+    }
+
+    @Test
+    public void testApplyStateGrowsForDeepKeys() throws TrieSpaceExhaustedException
+    {
+        // Every key length up to well past the initial stack size, each in a fresh trie so that every growth step is
+        // taken starting from the unallocated state.
+        for (int length = 0; length <= 100; ++length)
+        {
+            ByteComparable key = deepKey(length, 0x10);
+            trie = InMemoryTrie.shortLived(ByteComparable.Version.OSS50);
+            InMemoryTrie<String>.Mutator<String> mutator = trie.mutator((x, y) -> y, Predicates.alwaysFalse());
+            mutator.apply(Trie.singleton(key, ByteComparable.Version.OSS50, "v" + length));
+            assertEquals("v" + length, trie.get(key));
+            assertTrue(mutator.state.data.length > length * InMemoryBaseTrie.ApplyState.STATE_SIZE);
+
+            // The same for the data and deletion stacks of a deletion-aware trie. The deletion branch is rooted at the
+            // root of the trie, so the deletion stack is as deep as the range boundaries.
+            InMemoryDeletionAwareTrie<LivePoint, DeletionMarker> daTrie = InMemoryDeletionAwareTrie.shortLived(TrieUtil.VERSION);
+            var daMutator = daTrie.mutator(DataPoint::combineLive,
+                                           DataPoint::combineDeletion,
+                                           DataPoint::deleteLive,
+                                           DataPoint::deleteLive,
+                                           false,
+                                           v -> false);
+            ByteComparable left = deepKey(length, 0x10);
+            ByteComparable right = deepKey(length, 0x30);
+            ByteComparable live = deepKey(length, 0x40);
+            daMutator.apply(DeletionAwareTrie.deletedRange(ByteComparable.EMPTY, left, right, TrieUtil.VERSION, new DeletionMarker(left, 5, 5)));
+            daMutator.apply(DeletionAwareTrie.singleton(live, TrieUtil.VERSION, new LivePoint(live, 10)));
+            List<DataPoint> expected = List.of(new DeletionMarker(left, -1, 5),
+                                               new DeletionMarker(right, 5, -1),
+                                               new LivePoint(live, 10));
+            List<DataPoint> actual = DataPoint.toList(daTrie);
+            assertEquals(expected, actual);
+            assertEquals(expected.toString(), actual.toString()); // marker equality does not check positions
+            assertTrue(daMutator.state.data.length > length * InMemoryBaseTrie.ApplyState.STATE_SIZE);
+            assertTrue(daTrie.deletionState.data.length > length * InMemoryBaseTrie.ApplyState.STATE_SIZE);
+        }
+    }
+
+    /// A key of `length` bytes that are the same for all calls, followed by `last`.
+    private static ByteComparable deepKey(int length, int last)
+    {
+        byte[] bytes = new byte[length + 1];
+        for (int i = 0; i < length; ++i)
+            bytes[i] = (byte) (i + 1);
+        bytes[length] = (byte) last;
+        return ByteComparable.preencoded(ByteComparable.Version.OSS50, bytes);
     }
 }
