@@ -38,6 +38,7 @@ import org.openjdk.jmh.annotations.Param;
 import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
+import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Threads;
 import org.openjdk.jmh.annotations.Warmup;
 import org.openjdk.jmh.infra.Blackhole;
@@ -50,11 +51,14 @@ import org.openjdk.jmh.infra.Blackhole;
 ///
 /// `Cursor` is package-private, so the cursor-based lookup goes through a tail trie at the empty prefix, a view whose
 /// `get` is the default `BaseTrie.get`: one `InMemoryCursor` from `tailCursor`, then `descendAlong`.
+///
+/// Under `-f 0` the `@Fork` JVM arguments are ignored and must be given on the command line: `-ea`,
+/// `-XX:CompileCommandFile=conf/hotspot_compiler` and the heap size.
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
 @Warmup(iterations = 3, time = 1)
 @Measurement(iterations = 5, time = 1)
-@Fork(value = 1, jvmArgsAppend = { "-Xmx4G", "-Xms4G", "-Djmh.executor=CUSTOM", "-Djmh.executor.class=org.apache.cassandra.test.microbench.FastThreadExecutor"})
+@Fork(value = 1, jvmArgsAppend = { "-Xmx4G", "-Xms4G", "-XX:CompileCommandFile=conf/hotspot_compiler", "-Djmh.executor=CUSTOM", "-Djmh.executor.class=org.apache.cassandra.test.microbench.FastThreadExecutor"})
 @Threads(1)
 @State(Scope.Benchmark)
 public class TrieCursorAllocationBench
@@ -65,13 +69,17 @@ public class TrieCursorAllocationBench
     @Param({"OSS50"})
     ByteComparable.Version byteComparableVersion = ByteComparable.Version.OSS50;
 
-    @Param({"1000"})
-    int prefixCount = 1000;
+    /// `prefixCount`x`suffixesPerPrefix`. One parameter rather than two because JMH runs the cross product of
+    /// parameters. `1000000x1` has more branching nodes on the path to each key, so more lookups need more
+    /// backtracking entries than a cursor's initial allocation holds.
+    @Param({"1000x100", "1000000x1"})
+    String shape = "1000x100";
 
-    @Param({"100"})
-    int suffixesPerPrefix = 100;
+    int prefixCount;
+    int suffixesPerPrefix;
 
-    /// Number of entries covered by each `sliceIterateSmall` subtrie.
+    /// Number of entries covered by each `sliceIterateSmall` subtrie. When a prefix has fewer keys than this, slices
+    /// cover consecutive keys across prefixes.
     @Param({"8"})
     int sliceSize = 8;
 
@@ -95,13 +103,17 @@ public class TrieCursorAllocationBench
     @Setup(Level.Trial)
     public void setup() throws Throwable
     {
+        String[] dimensions = shape.split("x");
+        prefixCount = Integer.parseInt(dimensions[0]);
+        suffixesPerPrefix = Integer.parseInt(dimensions[1]);
         trie = InMemoryTrie.longLived(byteComparableVersion, bufferType, null);
         Random rand = new Random(1);
 
         int count = prefixCount * suffixesPerPrefix;
         keys = new ByteComparable[count];
         prefixes = new ByteComparable[prefixCount];
-        sliceLefts = new ByteComparable[prefixCount * (suffixesPerPrefix / sliceSize)];
+        int slicesPerPrefix = suffixesPerPrefix / sliceSize;
+        sliceLefts = new ByteComparable[slicesPerPrefix > 0 ? prefixCount * slicesPerPrefix : count / sliceSize];
         sliceRights = new ByteComparable[sliceLefts.length];
         int keyIndex = 0;
         int sliceIndex = 0;
@@ -129,6 +141,21 @@ public class TrieCursorAllocationBench
                 ++sliceIndex;
             }
         }
+        if (slicesPerPrefix == 0)
+        {
+            // Values are key indexes, so iterating the trie lists the keys in order.
+            int position = 0;
+            for (Integer index : trie.values())
+            {
+                if (position / sliceSize == sliceLefts.length)
+                    break;
+                if (position % sliceSize == 0)
+                    sliceLefts[position / sliceSize] = keys[index];
+                if (position % sliceSize == sliceSize - 1)
+                    sliceRights[position / sliceSize] = keys[index];
+                ++position;
+            }
+        }
         shuffle(keys, rand);
         shuffle(prefixes, rand);
         shufflePairs(sliceLefts, sliceRights, rand);
@@ -149,6 +176,14 @@ public class TrieCursorAllocationBench
 
         System.out.format("Trie size on heap %,d off heap %,d\n",
                           trie.usedSizeOnHeap(), trie.usedSizeOffHeap());
+    }
+
+    @TearDown(Level.Trial)
+    public void tearDown()
+    {
+        trie.discardBuffers();
+        trie = null;
+        cursorView = null;
     }
 
     @Benchmark

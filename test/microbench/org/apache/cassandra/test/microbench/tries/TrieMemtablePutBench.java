@@ -16,7 +16,6 @@
 
 package org.apache.cassandra.test.microbench.tries;
 
-import java.lang.reflect.Field;
 import java.util.Collections;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
@@ -32,6 +31,7 @@ import org.apache.cassandra.db.RangeTombstone;
 import org.apache.cassandra.db.Slice;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.marshal.LongType;
+import org.apache.cassandra.db.memtable.AbstractAllocatorMemtable;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.memtable.ShardBoundaries;
 import org.apache.cassandra.db.memtable.TrieMemtable;
@@ -49,6 +49,7 @@ import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.concurrent.Future;
 import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.cassandra.utils.memory.NativePool;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;
@@ -78,7 +79,10 @@ import org.openjdk.jmh.infra.BenchmarkParams;
 ///
 /// Outside the measurement: building the updates (row builders, the update's BTree), the commit log, `Mutation`
 /// and `Keyspace.apply`, index transactions and the memtable space check (`checkSpaceAndPut`). The write `OpOrder`
-/// group is held for a whole memtable lifetime rather than started per mutation.
+/// group is held for a whole memtable lifetime rather than started per mutation; it is only consulted when an
+/// allocation has to wait for memtable space, which never happens here. Trie cells released by overwrites are
+/// recycled through the owner's read order, on which no reader ever holds a group, so recycling is exercised but never
+/// waits for in-flight reads.
 ///
 /// The updates are pre-generated once per trial with strictly increasing timestamps. When the pool wraps, the
 /// memtable is replaced, so every update is applied to a memtable that has only seen older timestamps and cells are
@@ -86,12 +90,17 @@ import org.openjdk.jmh.infra.BenchmarkParams;
 /// pass over the pool, so no flush is ever required.
 ///
 /// The memtable uses `offheap_objects`, the default in `conf/cassandra.yaml`, regardless of the test configuration.
-/// This is fixed at class initialisation of the memtable, so it cannot be a parameter of an in-process (`-f 0`) run.
+/// It is set in the config before `daemonInitialization` and read at class initialisation into both
+/// `TrieMemtable.BUFFER_TYPE` and `AbstractAllocatorMemtable.MEMORY_POOL`, so it cannot be a parameter of an in-process
+/// (`-f 0`) run; setup fails if either was already initialised differently by an earlier benchmark in the same JVM.
+///
+/// Under `-f 0` the `@Fork` JVM arguments are ignored and must be given on the command line: `-ea`,
+/// `-XX:CompileCommandFile=conf/hotspot_compiler` and the heap size.
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.MICROSECONDS)
 @Warmup(iterations = 3, time = 1)
 @Measurement(iterations = 5, time = 1)
-@Fork(value = 1, jvmArgsAppend = { "-Xmx4G", "-Xms4G", "-Djmh.executor=CUSTOM", "-Djmh.executor.class=org.apache.cassandra.test.microbench.FastThreadExecutor"})
+@Fork(value = 1, jvmArgsAppend = { "-Xmx4G", "-Xms4G", "-XX:CompileCommandFile=conf/hotspot_compiler", "-Djmh.executor=CUSTOM", "-Djmh.executor.class=org.apache.cassandra.test.microbench.FastThreadExecutor"})
 @Threads(1) // memtable shards take writes under a lock, no point in concurrent writes
 @State(Scope.Benchmark)
 public class TrieMemtablePutBench
@@ -138,8 +147,11 @@ public class TrieMemtablePutBench
     @Setup(Level.Trial)
     public void setup(BenchmarkParams params) throws Throwable
     {
-        DatabaseDescriptor.daemonInitialization();
-        setOffHeapObjectsAllocation();
+        DatabaseDescriptor.daemonInitialization(() -> {
+            Config config = DatabaseDescriptor.loadConfig();
+            config.memtable_allocation_type = Config.MemtableAllocationType.offheap_objects;
+            return config;
+        });
 
         TableMetadata.Builder builder = TableMetadata.builder("ks", "t")
                                                      .partitioner(Murmur3Partitioner.instance)
@@ -154,6 +166,8 @@ public class TrieMemtablePutBench
             throw new AssertionError("Expected a trie memtable factory, got " + memtableFactory);
         if (TrieMemtable.BUFFER_TYPE != BufferType.OFF_HEAP)
             throw new AssertionError("TrieMemtable initialised with " + TrieMemtable.BUFFER_TYPE + " before the allocation type could be set");
+        if (!(AbstractAllocatorMemtable.MEMORY_POOL instanceof NativePool))
+            throw new AssertionError("Memtable pool initialised as " + AbstractAllocatorMemtable.MEMORY_POOL.getClass().getSimpleName() + " before the allocation type could be set");
 
         PartitionUpdate.Factory updateFactory = memtableFactory.partitionUpdateFactory();
         Random rand = new Random(1);
@@ -199,14 +213,6 @@ public class TrieMemtablePutBench
         }
 
         createMemtable();
-    }
-
-    static void setOffHeapObjectsAllocation() throws ReflectiveOperationException
-    {
-        Field confField = DatabaseDescriptor.class.getDeclaredField("conf");
-        confField.setAccessible(true);
-        Config conf = (Config) confField.get(null);
-        conf.memtable_allocation_type = Config.MemtableAllocationType.offheap_objects;
     }
 
     static Clustering<?> clustering(long ck)
