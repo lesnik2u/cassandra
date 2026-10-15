@@ -79,10 +79,13 @@ import org.openjdk.jmh.infra.BenchmarkParams;
 ///
 /// Outside the measurement: building the updates (row builders, the update's BTree), the commit log, `Mutation`
 /// and `Keyspace.apply`, index transactions and the memtable space check (`checkSpaceAndPut`). The write `OpOrder`
-/// group is held for a whole memtable lifetime rather than started per mutation; it is only consulted when an
-/// allocation has to wait for memtable space, which never happens here. Trie cells released by overwrites are
-/// recycled through the owner's read order, on which no reader ever holds a group, so recycling is exercised but never
-/// waits for in-flight reads.
+/// group is held for a whole memtable lifetime rather than started per mutation; `put` never consults it on this
+/// base (`MemtableAllocator.SubAllocator.allocate` ignores it), and the only wait for memtable space is `awaitRoom`
+/// in `AbstractAllocatorMemtable.checkSpaceAndPut`, which this benchmark bypasses. Trie cells released by overwrites
+/// are recycled through the owner's read order, on which no reader ever holds a group, so recycling is exercised but
+/// never waits for in-flight reads, so freed cells are reused at once. In production, concurrent reads can leave a
+/// full block waiting on its barrier, in which case fresh cells are allocated instead; this benchmark is therefore
+/// optimistic about allocation volume and cache locality, not about recycling work.
 ///
 /// The updates are pre-generated once per trial with strictly increasing timestamps. When the pool wraps, the
 /// memtable is replaced, so every update is applied to a memtable that has only seen older timestamps and cells are
@@ -90,12 +93,15 @@ import org.openjdk.jmh.infra.BenchmarkParams;
 /// pass over the pool, so no flush is ever required.
 ///
 /// The memtable uses `offheap_objects`, the default in `conf/cassandra.yaml`, regardless of the test configuration.
-/// It is set in the config before `daemonInitialization` and read at class initialisation into both
+/// It is supplied to `daemonInitialization`, before `applyAll`, and read at class initialisation into both
 /// `TrieMemtable.BUFFER_TYPE` and `AbstractAllocatorMemtable.MEMORY_POOL`, so it cannot be a parameter of an in-process
 /// (`-f 0`) run; setup fails if either was already initialised differently by an earlier benchmark in the same JVM.
+/// Under `-f 0` an earlier benchmark that initialised `DatabaseDescriptor` also wins, and setup fails with
+/// "DatabaseDescriptor already initialised with memtable_allocation_type=...".
 ///
 /// Under `-f 0` the `@Fork` JVM arguments are ignored and must be given on the command line: `-ea`,
-/// `-XX:CompileCommandFile=conf/hotspot_compiler` and the heap size.
+/// `-XX:CompileCommandFile=conf/hotspot_compiler` (the path is relative to the repo root and the JVM silently ignores
+/// a missing file) and the heap size.
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.MICROSECONDS)
 @Warmup(iterations = 3, time = 1)
@@ -147,6 +153,11 @@ public class TrieMemtablePutBench
     @Setup(Level.Trial)
     public void setup(BenchmarkParams params) throws Throwable
     {
+        if (DatabaseDescriptor.isDaemonInitialized() &&
+            DatabaseDescriptor.getMemtableAllocationType() != Config.MemtableAllocationType.offheap_objects)
+            throw new IllegalStateException("DatabaseDescriptor already initialised with memtable_allocation_type=" +
+                                            DatabaseDescriptor.getMemtableAllocationType() +
+                                            " in this JVM; run this benchmark alone or forked");
         DatabaseDescriptor.daemonInitialization(() -> {
             Config config = DatabaseDescriptor.loadConfig();
             config.memtable_allocation_type = Config.MemtableAllocationType.offheap_objects;

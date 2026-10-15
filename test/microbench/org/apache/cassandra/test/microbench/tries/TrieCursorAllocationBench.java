@@ -53,7 +53,8 @@ import org.openjdk.jmh.infra.Blackhole;
 /// `get` is the default `BaseTrie.get`: one `InMemoryCursor` from `tailCursor`, then `descendAlong`.
 ///
 /// Under `-f 0` the `@Fork` JVM arguments are ignored and must be given on the command line: `-ea`,
-/// `-XX:CompileCommandFile=conf/hotspot_compiler` and the heap size.
+/// `-XX:CompileCommandFile=conf/hotspot_compiler` (the path is relative to the repo root and the JVM silently ignores
+/// a missing file) and the heap size.
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
 @Warmup(iterations = 3, time = 1)
@@ -208,6 +209,8 @@ public class TrieCursorAllocationBench
         bh.consume(values.next());
     }
 
+    /// For the `1000000x1` shape the eight keys share only about two leading bytes, so this is effectively an
+    /// eight-partition range scan; compare results only within a shape.
     @Benchmark
     public void sliceIterateSmall(Blackhole bh)
     {
