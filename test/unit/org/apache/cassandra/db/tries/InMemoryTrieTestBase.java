@@ -268,6 +268,23 @@ public abstract class InMemoryTrieTestBase
         assertSameContent(inmem, expected);
     }
 
+    /// Every level of this trie has a sibling that the forward walk must come back to, so the cursor's backtracking
+    /// state has to grow several times past its initial capacity.
+    @Test
+    public void testDeepBacktracking()
+    {
+        Preencoded[] src = new Preencoded[200];
+        for (int i = 0; i < src.length; ++i)
+        {
+            byte[] key = new byte[i + 1];
+            key[i] = 1;
+            src[i] = ByteComparable.preencoded(VERSION, key);
+        }
+        SortedMap<Preencoded, ByteBuffer> content = new TreeMap<>(forwardComparator);
+        InMemoryTrie<ByteBuffer> trie = makeInMemoryTrie(src, content, usePut());
+        assertSameContent(trie, content);
+    }
+
     static Preencoded comparable(String s)
     {
         ByteBuffer b = ByteBufferUtil.bytes(s);

@@ -20,6 +20,7 @@ package org.apache.cassandra.db.tries;
 import java.util.Arrays;
 import java.util.function.Function;
 
+import net.nicoulaj.compilecommand.annotations.DontInline;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 import org.apache.cassandra.utils.bytecomparable.ByteSource;
@@ -631,27 +632,42 @@ public abstract class InMemoryReadTrie<T>
     ///
     /// To avoid allocations and pointer-chasing, the backtracking data is stored in a simple int array with
     /// `BACKTRACK_INTS_PER_ENTRY` ints for each level.
+    ///
+    /// Cursors are created very often and most of them are short-lived and never backtrack, so the array is only
+    /// allocated when the first entry is added.
     private static class CursorBacktrackingState
     {
         static final int BACKTRACK_INTS_PER_ENTRY = 3;
-        static final int BACKTRACK_INITIAL_SIZE = 16;
+        static final int BACKTRACK_INITIAL_SIZE = 8;
+        private static final int[] EMPTY_BACKTRACK = new int[0];
         private int[] backtrack;
         int backtrackDepth;
 
         CursorBacktrackingState()
         {
-            backtrack = new int[BACKTRACK_INITIAL_SIZE * BACKTRACK_INTS_PER_ENTRY];
+            backtrack = EMPTY_BACKTRACK;
             backtrackDepth = 0;
         }
 
         void addBacktrack(int node, int data, int depth)
         {
-            if (backtrackDepth * BACKTRACK_INTS_PER_ENTRY >= backtrack.length)
-                backtrack = Arrays.copyOf(backtrack, backtrack.length * 2);
-            backtrack[backtrackDepth * BACKTRACK_INTS_PER_ENTRY + 0] = node;
-            backtrack[backtrackDepth * BACKTRACK_INTS_PER_ENTRY + 1] = data;
-            backtrack[backtrackDepth * BACKTRACK_INTS_PER_ENTRY + 2] = depth;
+            int index = backtrackDepth * BACKTRACK_INTS_PER_ENTRY;
+            if (index >= backtrack.length)
+                growBacktrack();
+            backtrack[index + 0] = node;
+            backtrack[index + 1] = data;
+            backtrack[index + 2] = depth;
             ++backtrackDepth;
+        }
+
+        /// Growth happens at most a few times per cursor; keeping it out of line keeps [#addBacktrack], which is
+        /// inlined in all hot cursor paths, small.
+        @DontInline
+        private void growBacktrack()
+        {
+            backtrack = backtrack.length == 0
+                        ? new int[BACKTRACK_INITIAL_SIZE * BACKTRACK_INTS_PER_ENTRY]
+                        : Arrays.copyOf(backtrack, backtrack.length * 2);
         }
 
         int node(int backtrackDepth)
