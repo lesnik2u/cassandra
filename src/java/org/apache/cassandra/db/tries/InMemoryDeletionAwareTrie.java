@@ -279,6 +279,13 @@ extends InMemoryBaseTrie<T> implements DeletionAwareTrie<T, D>
         final InMemoryRangeTrie.MutatorStatic<D, E> deletionMutator;
         final InMemoryTrie.RangeMutator<T, E> deleter;
 
+        /// Cursor over our existing deletion branch, used to apply our deletions to the incoming data. Reused for all
+        /// deletion branches this mutator processes to avoid allocating a cursor and its backtracking array for each.
+        /// This is safe because mutations are single-threaded, and [DeletionAwareMergeSource] drops the cursor given
+        /// to [DeletionAwareMergeSource#addDeletions] before the mutation cursor leaves the deletion branch, i.e.
+        /// before [#applyDeletionBranch] can be called again.
+        private InMemoryRangeTrie.InMemoryRangeCursor<D> reusableDeletionBranchCursor;
+
         /// See [InMemoryDeletionAwareTrie#mutator(UpsertTransformer, UpsertTransformer, UpsertTransformer, BiFunction, boolean, Predicate, Predicate)]
         /// for the meaning of the parameters.
         Mutator(UpsertTransformer<T, V> dataTransformer,
@@ -355,7 +362,7 @@ extends InMemoryBaseTrie<T> implements DeletionAwareTrie<T, D>
                 // incoming deletions.
                 updatedAlternateBranch = hoistOurDeletionBranches();
             }
-            ourDeletionBranch = ((InMemoryDeletionAwareTrie<T, D>) state.trie()).makeRangeCursor(Direction.FORWARD, updatedAlternateBranch);
+            ourDeletionBranch = ourDeletionBranchCursor(updatedAlternateBranch);
 
             if (!deletionsAtFixedPoints && incomingAlternateBranch == null)
             {
@@ -382,6 +389,24 @@ extends InMemoryBaseTrie<T> implements DeletionAwareTrie<T, D>
             // to the position after this branch.
             applyDataUnderDeletion(ourDeletionBranch);
             return updatedAlternateBranch;
+        }
+
+        private RangeCursor<D> ourDeletionBranchCursor(int alternateBranch)
+        {
+            if (isNull(alternateBranch))
+                return null;
+            if (reusableDeletionBranchCursor == null)
+                return makeOurDeletionBranchCursor(alternateBranch);
+
+            reusableDeletionBranchCursor.reset(alternateBranch);
+            return reusableDeletionBranchCursor;
+        }
+
+        @SuppressWarnings({"unchecked", "rawtypes"})
+        private RangeCursor<D> makeOurDeletionBranchCursor(int alternateBranch)
+        {
+            reusableDeletionBranchCursor = new InMemoryRangeTrie.InMemoryRangeCursor<>((InMemoryReadTrie) state.trie(), Direction.FORWARD, alternateBranch);
+            return reusableDeletionBranchCursor;
         }
 
         private void applyDataUnderDeletion(RangeCursor<D> ourDeletionBranch) throws TrieSpaceExhaustedException

@@ -91,6 +91,22 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
             updateActiveAndReturn(encodedPosition());
         }
 
+        /// Reposition this cursor at the given root, discarding all of its state, so that it is in the same state as a
+        /// cursor newly constructed with the same trie, direction and root. This lets the single writer reuse one
+        /// cursor (and its backtracking array) instead of allocating a new one for every mutation.
+        void reset(int root)
+        {
+            assert getClass() == InMemoryRangeCursor.class : "Subclasses carry additional root state and cannot be reset";
+            backtrackDepth = 0;
+            depth = 0;
+            currentPosition = Cursor.rootPosition(direction);
+            setCurrentNodeAndApplyPrefixes(root, 0, 0, true);
+            activeIsSet = true;
+            activeRange = null;
+            prevContent = null;
+            updateActiveAndReturn(encodedPosition());
+        }
+
         @Override
         public long advance()
         {
