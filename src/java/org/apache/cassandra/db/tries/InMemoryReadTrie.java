@@ -725,6 +725,17 @@ public abstract class InMemoryReadTrie<T>
             this.trie = trie;
             this.direction = direction;
             this.presentContentOnDescentPath = presentContentOnDescentPath;
+            init(root);
+        }
+
+        /// Position the cursor at the given root, initializing all of its mutable state. Also used by subclasses that
+        /// can reposition the cursor to reuse it.
+        /// Because this is called by the constructor, overrides run before the subclass constructor: they must not
+        /// use any state that constructor sets, and the fields they initialize must not have initializers.
+        void init(int root)
+        {
+            // Must be cleared before the call below, which may add a backtracking entry for return-path root content.
+            backtrackDepth = 0;
             depth = 0;
             currentPosition = Cursor.rootPosition(direction);
             setCurrentNodeAndApplyPrefixes(root, 0, 0, true);

@@ -16,6 +16,7 @@
 
 package org.apache.cassandra.db.tries;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
 
@@ -25,16 +26,16 @@ import org.junit.Test;
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 
+import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_RANDOM_SEED;
 import static org.apache.cassandra.db.tries.DataPoint.toList;
 import static org.apache.cassandra.db.tries.TrieUtil.VERSION;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 
-/// Tests that a deletion-aware mutator used for many mutations, as memtables do, gives the same result as using a
-/// fresh mutator for every mutation. In particular, the existing deletions must be applied correctly to the incoming
-/// data at every deletion branch, also when an earlier mutation left the cursor over a deletion branch in the middle
-/// of that branch.
+/// Tests that a deletion-aware mutator used for many mutations, as memtables do, gives the same result as merging
+/// all the mutations. In particular, the existing deletions must be applied correctly to the incoming data at every
+/// deletion branch, also when an earlier mutation left the cursor over a deletion branch in the middle of that branch.
 public class InMemoryDeletionAwareTrieMutatorTest
 {
     static final int PARTITIONS = 8;
@@ -86,29 +87,58 @@ public class InMemoryDeletionAwareTrieMutatorTest
     }
 
     @Test
-    public void testRandomMutationsMatchFreshMutators() throws TrieSpaceExhaustedException
+    public void testPartitionDeletionsAppliedToIncomingData() throws TrieSpaceExhaustedException
     {
-        long seed = new Random().nextLong();
-        System.out.println("Seed: " + seed);
-        testRandomMutationsMatchFreshMutators(new Random(seed), true);
-        testRandomMutationsMatchFreshMutators(new Random(seed), false);
+        testPartitionDeletionsAppliedToIncomingData(true);
+        testPartitionDeletionsAppliedToIncomingData(false);
     }
 
-    private void testRandomMutationsMatchFreshMutators(Random rand, boolean deletionsAtFixedPoints) throws TrieSpaceExhaustedException
+    /// Deletion branches whose root carries a covering deletion (as partition deletions are written), so that a
+    /// cursor at the branch root has the closing boundary waiting on its return path.
+    private void testPartitionDeletionsAppliedToIncomingData(boolean deletionsAtFixedPoints) throws TrieSpaceExhaustedException
     {
-        InMemoryDeletionAwareTrie<LivePoint, DeletionMarker> reused = InMemoryDeletionAwareTrie.shortLived(VERSION);
-        InMemoryDeletionAwareTrie<LivePoint, DeletionMarker> fresh = InMemoryDeletionAwareTrie.shortLived(VERSION);
-        var reusedMutator = mutator(reused, deletionsAtFixedPoints);
+        InMemoryDeletionAwareTrie<LivePoint, DeletionMarker> trie = InMemoryDeletionAwareTrie.shortLived(VERSION);
+        var mutator = mutator(trie, deletionsAtFixedPoints);
+
+        mutator.apply(partitionDeletion(0x40, 10));
+        mutator.apply(partitionDeletion(0x50, 10));
+
+        // The first creates the mutator's cursor over our deletion branch, the second reuses it.
+        mutator.apply(rows(0x40, 5, 0x1000));
+        mutator.apply(rows(0x50, 5, 0x1000));
+        assertNull(trie.get(key(0x40, 0x1000)));
+        assertNull(trie.get(key(0x50, 0x1000)));
+    }
+
+    @Test
+    public void testRandomMutationsMatchMergedView() throws TrieSpaceExhaustedException
+    {
+        long seed = TEST_RANDOM_SEED.getLong(new Random().nextLong());
+        System.out.println("Seed: " + seed + " (rerun with -D" + TEST_RANDOM_SEED.getKey() + '=' + seed + ')');
+        testRandomMutationsMatchMergedView(new Random(seed), true);
+        testRandomMutationsMatchMergedView(new Random(seed), false);
+    }
+
+    private void testRandomMutationsMatchMergedView(Random rand, boolean deletionsAtFixedPoints) throws TrieSpaceExhaustedException
+    {
+        InMemoryDeletionAwareTrie<LivePoint, DeletionMarker> trie = InMemoryDeletionAwareTrie.shortLived(VERSION);
+        var mutator = mutator(trie, deletionsAtFixedPoints);
+        List<DeletionAwareTrie<LivePoint, DeletionMarker>> mutations = new ArrayList<>();
 
         for (int i = 0; i < 1000; ++i)
         {
             DeletionAwareTrie<LivePoint, DeletionMarker> mutation = randomMutation(rand);
-            reusedMutator.apply(mutation);
-            mutator(fresh, deletionsAtFixedPoints).apply(mutation);
+            mutator.apply(mutation);
+            mutations.add(mutation);
         }
 
-        List<DataPoint> expected = toList(fresh);
-        List<DataPoint> actual = toList(reused);
+        // The mutator's result must match a merged view of all mutations, which does not involve the mutator.
+        List<DataPoint> expected = toList(DeletionAwareTrie.merge(mutations,
+                                                                  LivePoint::combineCollection,
+                                                                  DeletionMarker::combineCollection,
+                                                                  DeletionMarker::applyTo,
+                                                                  deletionsAtFixedPoints));
+        List<DataPoint> actual = toList(trie);
         assertEquals(expected, actual);
         assertEquals(expected.toString(), actual.toString()); // marker equality does not check positions
     }
@@ -169,6 +199,15 @@ public class InMemoryDeletionAwareTrieMutatorTest
                                               clustering(right),
                                               VERSION,
                                               new DeletionMarker(key(partition, left), timestamp, timestamp));
+    }
+
+    private static DeletionAwareTrie<LivePoint, DeletionMarker> partitionDeletion(int partition, int timestamp)
+    {
+        return DeletionAwareTrie.deletionBranch(bytes(partition),
+                                                VERSION,
+                                                RangeTrie.branch(ByteComparable.EMPTY,
+                                                                 VERSION,
+                                                                 new DeletionMarker(bytes(partition), timestamp, timestamp)));
     }
 
     private static ByteComparable key(int partition, int clustering)

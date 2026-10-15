@@ -85,6 +85,12 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
         {
             // Range tries must always preserve the order of boundaries with respect to descendants.
             super(trie, direction, root, false);
+        }
+
+        @Override
+        void init(int root)
+        {
+            super.init(root);
             activeIsSet = true;
             activeRange = null;
             prevContent = null;
@@ -96,15 +102,7 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
         /// cursor (and its backtracking array) instead of allocating a new one for every mutation.
         void reset(int root)
         {
-            assert getClass() == InMemoryRangeCursor.class : "Subclasses carry additional root state and cannot be reset";
-            backtrackDepth = 0;
-            depth = 0;
-            currentPosition = Cursor.rootPosition(direction);
-            setCurrentNodeAndApplyPrefixes(root, 0, 0, true);
-            activeIsSet = true;
-            activeRange = null;
-            prevContent = null;
-            updateActiveAndReturn(encodedPosition());
+            init(root);
         }
 
         @Override
@@ -313,6 +311,12 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
                                                       : NOT_FOUND;
             else
                 return super.advanceToNextChildWithTarget(node, data, transition);
+        }
+
+        @Override
+        void reset(int root)
+        {
+            throw new UnsupportedOperationException("The root content of a branch cursor is fixed at construction");
         }
 
         long presentAscentPathContent()

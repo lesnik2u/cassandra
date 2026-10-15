@@ -26,6 +26,7 @@ import javax.annotation.Nonnull;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 
+import net.nicoulaj.compilecommand.annotations.DontInline;
 import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
@@ -1108,6 +1109,7 @@ public abstract class InMemoryBaseTrie<T> extends InMemoryReadTrie<T>
         }
 
         /// Make room for the stack entry at `currentDepth`. Kept out of [#descendInto] to keep the descent path small.
+        @DontInline
         private void growData()
         {
             data = Arrays.copyOf(data, Math.max(currentDepth * 2, INITIAL_DEPTH) * STATE_SIZE);

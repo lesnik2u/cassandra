@@ -282,8 +282,8 @@ extends InMemoryBaseTrie<T> implements DeletionAwareTrie<T, D>
         /// Cursor over our existing deletion branch, used to apply our deletions to the incoming data. Reused for all
         /// deletion branches this mutator processes to avoid allocating a cursor and its backtracking array for each.
         /// This is safe because mutations are single-threaded, and [DeletionAwareMergeSource] drops the cursor given
-        /// to [DeletionAwareMergeSource#addDeletions] before the mutation cursor leaves the deletion branch, i.e.
-        /// before [#applyDeletionBranch] can be called again.
+        /// to [DeletionAwareMergeSource#addDeletions] on the advance that leaves the deletion branch (or earlier, if
+        /// the cursor is exhausted first), i.e. before [#applyDeletionBranch] can be called again.
         private InMemoryRangeTrie.InMemoryRangeCursor<D> reusableDeletionBranchCursor;
 
         /// See [InMemoryDeletionAwareTrie#mutator(UpsertTransformer, UpsertTransformer, UpsertTransformer, BiFunction, boolean, Predicate, Predicate)]
@@ -398,6 +398,8 @@ extends InMemoryBaseTrie<T> implements DeletionAwareTrie<T, D>
             if (reusableDeletionBranchCursor == null)
                 return makeOurDeletionBranchCursor(alternateBranch);
 
+            // The merge source must have dropped the cursor when it left the previous deletion branch.
+            assert !mutationCursor.hasDeletions();
             reusableDeletionBranchCursor.reset(alternateBranch);
             return reusableDeletionBranchCursor;
         }
