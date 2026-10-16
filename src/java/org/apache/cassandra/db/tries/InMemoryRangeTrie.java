@@ -180,16 +180,25 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
         private void setActiveState()
         {
             assert content() == null;
-            S nearestContent = getNearestContent(direction);
+            int nearestContentId = getNearestContentId(direction);
             // Note: the nearest content may change between the time we fetch it and when we reach that node, e.g.
             // if someone deletes aa-cd where there existed an abc-acd deletion, and we fetched the latter while at "a".
             // This, though, should only be possible if the preceding state of the nearest content is null.
-            activeRange = nearestContent != null ? nearestContent.precedingState(direction) : null;
+            // Most often the preceding state is null (e.g. the start of a deleted row); skip deserializing it then.
+            activeRange = isNull(nearestContentId) || trie.precedingStateIsNull(nearestContentId, direction)
+                          ? null
+                          : trie.getContent(nearestContentId).precedingState(direction);
             prevContent = null;
             activeIsSet = true;
         }
 
         private S getNearestContent(Direction direction)
+        {
+            int contentId = getNearestContentId(direction);
+            return isNull(contentId) ? null : trie.getContent(contentId);
+        }
+
+        private int getNearestContentId(Direction direction)
         {
             // Descend into the children of the node until content is found, making sure to ignore return-path content
             // for non-leaf nodes (because there must be a leaf that is before them in iteration order).
@@ -199,7 +208,7 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
             //   new InMemoryRangeCursor<>(trie, direction, currentFullNode).advanceToContent(null);
             int node = currentFullNode;
             if (isNull(node))
-                return null;
+                return NONE;
             while (true)
             {
                 assert !isNull(node);
@@ -207,14 +216,14 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
                 {
                     // We have reached the bottom of the branch. Report regardless of direction as it's the closest
                     // content either way.
-                    return trie.getContent(node);
+                    return node;
                 }
 
                 if (offset(node) == PREFIX_OFFSET)
                 {
                     int contentId = trie.getIntVolatile(node + direction.select(PREFIX_CONTENT_OFFSET, PREFIX_ALTERNATE_OFFSET));
                     if (isLeaf(contentId))
-                        return trie.getContent(contentId);
+                        return contentId;
 
                     node = trie.followPrefixTransition(node);
                     assert !isNull(node);
@@ -377,13 +386,13 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
             return (ApplyState<S>) super.start(root, droppedContentCallback);
         }
 
-        private S getFirstChildContent(int node)
+        private int getFirstChildContentId(int node)
         {
             while (true)
             {
                 int contentId = getDescentPathContentId(node);
                 if (contentId != NONE)
-                    return trie.getContent(contentId);
+                    return contentId;
 
                 int next = trie.getNextChild(node, 0);
 
@@ -391,21 +400,22 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
                 {
                     int returnPathContent = getAscentPathContentId(node);
                     assert returnPathContent != NONE;
-                    return trie.getContent(returnPathContent);
+                    return returnPathContent;
                 }
                 node = next;
             }
         }
 
-        /// Get the nearest content following the current position. This is used to establish the range that applies to
-        /// the current position after we have followed a mutation path which is done by skipping over our boundaries.
-        private S getNearestContent(boolean onReturnPath)
+        /// Get the id of the nearest content following the current position, or `NONE` if there is none. This is used
+        /// to establish the range that applies to the current position after we have followed a mutation path which is
+        /// done by skipping over our boundaries.
+        private int getNearestContentId(boolean onReturnPath)
         {
             // 1. If not on the return path, and the node we are positioned on exists, descend until we find content.
             // If we can't descend any further, there must be return-side content there. We are done.
             int fullNode = existingFullNode();
             if (fullNode != NONE && !onReturnPath)
-                return getFirstChildContent(fullNode);
+                return getFirstChildContentId(fullNode);
 
             // 2. If the node we are positioned on did not exist, or we are looking for return-path data, ascend until
             // we find a node that exists.
@@ -421,7 +431,7 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
             }
 
             if (node == NONE)
-                return null;
+                return NONE;
 
             while (true)
             {
@@ -429,14 +439,14 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
                 // into that child and perform 1.
                 int child = trie.getNextChild(node, transitionAtDepth(stackPos) + 1);
                 if (child != NONE)
-                    return getFirstChildContent(child);
+                    return getFirstChildContentId(child);
                 // 4. If not, check return path content -- return if present.
                 int returnPathId = getAscentPathContentId(node);
                 if (returnPathId != NONE)
-                    return trie.getContent(returnPathId);
+                    return returnPathId;
                 // 5. Otherwise, go up one level and back to 3.
                 if (--stackPos < 0)
-                    return null;
+                    return NONE;
                 node = existingFullNodeAtDepth(stackPos);
             }
         }
@@ -793,11 +803,12 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
 
         S getExistingCoveringState(boolean onReturnPath)
         {
-            S existingCoveringState = state.getNearestContent(onReturnPath);
-            if (existingCoveringState != null)
-                return existingCoveringState.precedingState(Direction.FORWARD);
+            int nearestContentId = state.getNearestContentId(onReturnPath);
+            // Skip deserializing the nearest content if we can tell that its preceding state is null.
+            if (nearestContentId == NONE || state.trie.precedingStateIsNull(nearestContentId, Direction.FORWARD))
+                return null;
 
-            return null;
+            return state.trie.getContent(nearestContentId).precedingState(Direction.FORWARD);
         }
 
         static <S extends RangeState<S>> S rightSideAsCovering(S rangeState)

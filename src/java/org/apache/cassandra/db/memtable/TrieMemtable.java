@@ -1291,6 +1291,16 @@ public class TrieMemtable extends AbstractShardedMemtable
             return TrieTombstoneMarker.make(left, right, levelMarker);
         }
 
+        @Override
+        public boolean precedingStateIsNull(UnsafeBuffer buffer, int inBufferPos, int offsetBits, Direction direction)
+        {
+            if (offsetBits != TYPE_TOMBSTONE_MARKER_BEFORE_BRANCH && offsetBits != TYPE_TOMBSTONE_MARKER_AFTER_BRANCH)
+                return false;
+            // The preceding state is the left side in the forward direction; an absent side has a negative kind.
+            int side = direction.select(OFFSET_TOMBSTONE_LEFT, OFFSET_TOMBSTONE_RIGHT);
+            return buffer.getByte(inBufferPos + side + OFFSET_TOMBSTONE_KIND) < 0;
+        }
+
         private TrieTombstoneMarker.Covering deserializeTombstoneSide(UnsafeBuffer buffer, int inBufferPos)
         {
             byte kind = buffer.getByte(inBufferPos + OFFSET_TOMBSTONE_KIND);

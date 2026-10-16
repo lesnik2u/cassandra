@@ -52,6 +52,16 @@ public interface ContentManager<T> extends MemoryManager
     /// @return the current content value.
     T getContent(int id);
 
+    /// Returns true if the content for the given pointer is a [RangeState] whose
+    /// [preceding state][RangeState#precedingState] in the given direction is null, and this can be determined without
+    /// getting the content. Returning false says nothing about the state; the caller must get the content to find it.
+    ///
+    /// Lets range trie walks that only need the preceding state of the nearest content skip deserializing it.
+    default boolean precedingStateIsNull(int contentId, Direction direction)
+    {
+        return false;
+    }
+
     /// Returns false if the given contentId should be presented before the children of the branch in forward direction,
     /// and true if it should be presented after them.
     boolean shouldPresentAfterBranch(int contentId);

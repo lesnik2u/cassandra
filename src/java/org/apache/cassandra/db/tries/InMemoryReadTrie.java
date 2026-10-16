@@ -232,6 +232,11 @@ public abstract class InMemoryReadTrie<T>
         return contentManager.getContent(id);
     }
 
+    boolean precedingStateIsNull(int contentId, Direction direction)
+    {
+        return contentManager.precedingStateIsNull(contentId, direction);
+    }
+
     boolean shouldPresentAfterBranch(int contentId)
     {
         return contentManager.shouldPresentAfterBranch(contentId);
