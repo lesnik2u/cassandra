@@ -75,7 +75,7 @@ import org.openjdk.jmh.infra.BenchmarkParams;
 /// tombstones), copying the cells into memtable memory, and the shard statistics. Also inside, amortised over
 /// `partitions * updatesPerPartition` puts: replacing the memtable with a fresh one (discarding the old) when the
 /// pool of updates wraps, plus, for [#putWithExistingRangeDeletions], seeding the fresh memtable with one range
-/// tombstone per partition.
+/// tombstone (and, with `rowDeletion`, one deleted row) per partition.
 ///
 /// Outside the measurement: building the updates (row builders, the update's BTree), the commit log, `Mutation`
 /// and `Keyspace.apply`, index transactions and the memtable space check (`checkSpaceAndPut`). The write `OpOrder`
@@ -123,6 +123,11 @@ public class TrieMemtablePutBench
     @Param({"false", "true"})
     boolean rangeDeletion = true;
 
+    /// When true, each update also deletes the row just after its rows (a row with a row deletion and no cells), so
+    /// the memtable accumulates row-level tombstone markers and later puts to the same partition descend through them.
+    @Param({"false", "true"})
+    boolean rowDeletion = false;
+
     /// Number of distinct partitions; updates cycle through them, so all but the first put to a partition merge into
     /// existing data.
     @Param({"1000"})
@@ -143,7 +148,8 @@ public class TrieMemtablePutBench
     TableMetadata metadata;
     Memtable.Factory memtableFactory;
     PartitionUpdate[] updates;
-    /// One partition-wide range tombstone per partition, older than all updates. Only used by
+    /// One partition-wide range tombstone per partition, older than all updates, plus, with `rowDeletion`, one
+    /// deleted row per partition, newer than the range tombstone but older than all updates. Only used by
     /// [#putWithExistingRangeDeletions].
     PartitionUpdate[] seedUpdates;
 
@@ -195,7 +201,8 @@ public class TrieMemtablePutBench
         {
             long timestamp = BASE_TIMESTAMP + i;
             PartitionUpdate.Builder update = updateFactory.builder(metadata, keys[i % partitions], metadata.regularAndStaticColumns(), rowsPerUpdate);
-            int firstClustering = rand.nextInt(clusteringsPerPartition - rowsPerUpdate - RANGE_TOMBSTONE_WIDTH + 1);
+            int deletedRows = rowDeletion ? 1 : 0;
+            int firstClustering = rand.nextInt(clusteringsPerPartition - rowsPerUpdate - deletedRows - RANGE_TOMBSTONE_WIDTH + 1);
             for (int r = 0; r < rowsPerUpdate; ++r)
             {
                 // Built the way UpdateParameters builds an UPDATE: unsorted builder, no primary key liveness.
@@ -205,9 +212,11 @@ public class TrieMemtablePutBench
                     row.addCell(BufferCell.live(column, timestamp, LongType.instance.decompose(rand.nextLong())));
                 update.add(row.build());
             }
+            if (rowDeletion)
+                update.add(deletedRow(updateFactory, firstClustering + rowsPerUpdate, DeletionTime.build(timestamp, nowInSec)));
             if (rangeDeletion)
             {
-                int start = firstClustering + rowsPerUpdate;
+                int start = firstClustering + rowsPerUpdate + deletedRows;
                 update.add(new RangeTombstone(Slice.make(clustering(start), clustering(start + RANGE_TOMBSTONE_WIDTH - 1)),
                                               DeletionTime.build(timestamp, nowInSec)));
             }
@@ -219,9 +228,11 @@ public class TrieMemtablePutBench
             seedUpdates = new PartitionUpdate[partitions];
             for (int i = 0; i < partitions; ++i)
             {
-                PartitionUpdate.Builder update = updateFactory.builder(metadata, keys[i], metadata.regularAndStaticColumns(), 0);
+                PartitionUpdate.Builder update = updateFactory.builder(metadata, keys[i], metadata.regularAndStaticColumns(), rowDeletion ? 1 : 0);
                 update.add(new RangeTombstone(Slice.make(clustering(0), clustering(clusteringsPerPartition - 1)),
-                                              DeletionTime.build(BASE_TIMESTAMP - 1, nowInSec)));
+                                              DeletionTime.build(BASE_TIMESTAMP - 2, nowInSec)));
+                if (rowDeletion)
+                    update.add(deletedRow(updateFactory, clusteringsPerPartition / 2, DeletionTime.build(BASE_TIMESTAMP - 1, nowInSec)));
                 seedUpdates[i] = update.build();
             }
         }
@@ -232,6 +243,15 @@ public class TrieMemtablePutBench
     static Clustering<?> clustering(long ck)
     {
         return Clustering.make(LongType.instance.decompose(ck));
+    }
+
+    /// A row deleted the way `UpdateParameters` builds a CQL `DELETE` of a whole row: a row deletion and no cells.
+    private Row deletedRow(PartitionUpdate.Factory updateFactory, long ck, DeletionTime deletion)
+    {
+        Row.Builder row = updateFactory.rowBuilder(metadata.regularColumns(), false);
+        row.newRow(clustering(ck));
+        row.addRowDeletion(Row.Deletion.regular(deletion));
+        return row.build();
     }
 
     @TearDown(Level.Trial)
@@ -247,8 +267,8 @@ public class TrieMemtablePutBench
     }
 
     /// Same as [#put], but every partition is seeded with an older range tombstone covering all its clusterings
-    /// when the memtable is created, so every put hits an existing deletion branch, whether or not the update itself
-    /// carries a range tombstone (`rangeDeletion`).
+    /// (and, with `rowDeletion`, one older deleted row) when the memtable is created, so every put hits an existing
+    /// deletion branch, whether or not the update itself carries a range tombstone (`rangeDeletion`).
     @Benchmark
     public long putWithExistingRangeDeletions()
     {
