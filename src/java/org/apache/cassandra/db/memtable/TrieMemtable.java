@@ -1084,6 +1084,10 @@ public class TrieMemtable extends AbstractShardedMemtable
         /// Byte that stores whether the tombstone marker is also a row marker
         static final int OFFSET_TOMBSTONE_IS_ROW_MARKER = 0x00;
 
+        /// Tombstone kinds by ordinal. `Kind.values()` clones the array on every call, which is not eliminated in
+        /// [#deserializeTombstoneSide].
+        private static final TrieTombstoneMarker.Kind[] TOMBSTONE_KINDS = TrieTombstoneMarker.Kind.values();
+
         @VisibleForTesting
         public TrieSerializer(CellDataBufferManager manager, MemtableShard owner)
         {
@@ -1308,7 +1312,7 @@ public class TrieMemtable extends AbstractShardedMemtable
                 return null;
             return TrieTombstoneMarker.covering(buffer.getLong(inBufferPos + OFFSET_TIMESTAMP),
                                                 CellData.deletionTimeUnsignedIntegerToLong(buffer.getInt(inBufferPos + OFFSET_LOCAL_DELETION_TIME)),
-                                                TrieTombstoneMarker.Kind.values()[kind]);
+                                                TOMBSTONE_KINDS[kind]);
         }
 
         @Override
