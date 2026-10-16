@@ -52,7 +52,7 @@ public interface ContentManager<T> extends MemoryManager
     /// @return the current content value.
     T getContent(int id);
 
-    /// Returns true if the content for the given pointer is a [RangeState] whose
+    /// Returns true if the content for the given pointer is null or a [RangeState] whose
     /// [preceding state][RangeState#precedingState] in the given direction is null, and this can be determined without
     /// getting the content. Returning false says nothing about the state; the caller must get the content to find it.
     ///

@@ -185,17 +185,15 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
             // if someone deletes aa-cd where there existed an abc-acd deletion, and we fetched the latter while at "a".
             // This, though, should only be possible if the preceding state of the nearest content is null.
             // Most often the preceding state is null (e.g. the start of a deleted row); skip deserializing it then.
-            activeRange = isNull(nearestContentId) || trie.precedingStateIsNull(nearestContentId, direction)
-                          ? null
-                          : trie.getContent(nearestContentId).precedingState(direction);
+            if (isNull(nearestContentId) || trie.precedingStateIsNull(nearestContentId, direction))
+                activeRange = null;
+            else
+            {
+                S nearestContent = trie.getContent(nearestContentId);
+                activeRange = nearestContent != null ? nearestContent.precedingState(direction) : null;
+            }
             prevContent = null;
             activeIsSet = true;
-        }
-
-        private S getNearestContent(Direction direction)
-        {
-            int contentId = getNearestContentId(direction);
-            return isNull(contentId) ? null : trie.getContent(contentId);
         }
 
         private int getNearestContentId(Direction direction)
@@ -275,7 +273,15 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
             if (contentAtRoot != null)
                 return contentAtRoot.restrict(!direction.isForward(), direction.isForward());
             if (!activeRangeKnown)
-                activeRange = getNearestContent(direction);
+            {
+                // Only the preceding state of the nearest content is used below; the nearest content itself is neither
+                // restricted nor returned. If that preceding state is null, so is the result, and we can return it
+                // without deserializing the content.
+                int nearestContentId = getNearestContentId(direction);
+                if (isNull(nearestContentId) || trie.precedingStateIsNull(nearestContentId, direction))
+                    return null;
+                activeRange = trie.getContent(nearestContentId);
+            }
             if (activeRange == null)
                 return null;
             activeRange = activeRange.precedingState(direction);
@@ -808,7 +814,8 @@ public class InMemoryRangeTrie<S extends RangeState<S>> extends InMemoryBaseTrie
             if (nearestContentId == NONE || state.trie.precedingStateIsNull(nearestContentId, Direction.FORWARD))
                 return null;
 
-            return state.trie.getContent(nearestContentId).precedingState(Direction.FORWARD);
+            S nearestContent = state.trie.getContent(nearestContentId);
+            return nearestContent != null ? nearestContent.precedingState(Direction.FORWARD) : null;
         }
 
         static <S extends RangeState<S>> S rightSideAsCovering(S rangeState)

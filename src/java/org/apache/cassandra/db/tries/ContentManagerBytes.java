@@ -79,12 +79,12 @@ class ContentManagerBytes<T> implements ContentManager<T>
     }
 
     @Override
-    public boolean precedingStateIsNull(int id, Direction direction)
+    public boolean precedingStateIsNull(int contentId, Direction direction)
     {
-        int offset = offset(id);
+        int offset = offset(contentId);
         if (offset == OFFSET_SPECIAL)
             return false; // specials take no cell, getting them is cheap
-        int cell = id & MASK_ID_TO_CELL;
+        int cell = contentId & MASK_ID_TO_CELL;
         return serializer.precedingStateIsNull(bufferManager.getBuffer(cell), bufferManager.inBufferOffset(cell), offset, direction);
     }
 

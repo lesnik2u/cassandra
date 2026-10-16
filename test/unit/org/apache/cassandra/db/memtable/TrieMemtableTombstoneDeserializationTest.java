@@ -16,6 +16,10 @@
 
 package org.apache.cassandra.db.memtable;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -28,6 +32,8 @@ import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.RangeTombstone;
 import org.apache.cassandra.db.Slice;
+import org.apache.cassandra.db.Slices;
+import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.partitions.TrieBackedPartition;
@@ -37,6 +43,8 @@ import org.apache.cassandra.db.rows.BufferCell;
 import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.TrieTombstoneMarker;
+import org.apache.cassandra.db.rows.Unfiltered;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.tries.Direction;
 import org.apache.cassandra.db.tries.InMemoryDeletionAwareTrie;
 import org.apache.cassandra.db.tries.TrieSpaceExhaustedException;
@@ -55,6 +63,7 @@ import org.apache.cassandra.utils.memory.MemtablePool;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 /// Checks which writes into a partition with an existing deletion branch need to deserialise the branch's tombstone
@@ -147,6 +156,94 @@ public class TrieMemtableTombstoneDeserializationTest
     }
 
     @Test
+    public void testRowReadBesideRowDeletionsDoesNotDeserializeMarkers()
+    {
+        Partition partition = new Partition();
+        PartitionUpdate.Builder deletions = builder(3);
+        for (int ck : new int[]{ 10, 20, 30 })
+            deletions.add(deletedRow(ck, DELETION_TIMESTAMP));
+        partition.apply(deletions.build());
+        partition.apply(rowUpdate(15, NEWER_TIMESTAMP));
+        partition.apply(rowUpdate(25, NEWER_TIMESTAMP));
+        TrieBackedPartition read = partition.read();
+
+        for (int ck : new int[]{ 15, 25 })
+        {
+            partition.serializer.markersDeserialized = 0;
+            Row row = read.getRow(clustering(ck));
+            assertNotNull(row.getCell(column));
+            assertTrue(row.deletion().isLive());
+            assertEquals(0, partition.serializer.markersDeserialized);
+
+            for (boolean reversed : new boolean[]{ false, true })
+            {
+                partition.serializer.markersDeserialized = 0;
+                row = readRow(read, ck, reversed);
+                assertNotNull(row.getCell(column));
+                assertTrue(row.deletion().isLive());
+                assertEquals(0, partition.serializer.markersDeserialized);
+            }
+        }
+    }
+
+    @Test
+    public void testRowReadUnderRangeDeletionDeserializesMarkers()
+    {
+        Partition partition = new Partition();
+        PartitionUpdate.Builder deletion = builder(0);
+        deletion.add(new RangeTombstone(Slice.make(clustering(10), clustering(30)),
+                                        DeletionTime.build(DELETION_TIMESTAMP, 0)));
+        partition.apply(deletion.build());
+        partition.apply(rowUpdate(15, NEWER_TIMESTAMP));
+        TrieBackedPartition read = partition.read();
+
+        partition.serializer.markersDeserialized = 0;
+        assertNotNull(read.getRow(clustering(15)).getCell(column));
+        assertTrue(partition.serializer.markersDeserialized > 0);
+
+        for (boolean reversed : new boolean[]{ false, true })
+        {
+            partition.serializer.markersDeserialized = 0;
+            assertNotNull(readRow(read, 15, reversed).getCell(column));
+            assertTrue(partition.serializer.markersDeserialized > 0);
+        }
+    }
+
+    /// A forward read takes a tail at each boundary of a range deletion, and the tail needs the boundary's preceding
+    /// state in the reverse direction. The cursor finds it from the nearest marker, which is the boundary itself. For
+    /// the boundary that closes the deletion that state is absent, and the boundary must not be deserialised again to
+    /// find that out. (A reverse read presents these boundaries on the return path and takes no tail at them.)
+    @Test
+    public void testForwardRangeDeletionReadDoesNotDeserializeClosingBoundaryForTail()
+    {
+        Partition partition = new Partition();
+        PartitionUpdate.Builder deletion = builder(0);
+        deletion.add(new RangeTombstone(Slice.make(clustering(10), clustering(30)),
+                                        DeletionTime.build(DELETION_TIMESTAMP, 0)));
+        partition.apply(deletion.build());
+        partition.apply(rowUpdate(15, NEWER_TIMESTAMP));
+        TrieBackedPartition read = partition.read();
+
+        partition.serializer.deserializedMarkers.clear();
+        List<Unfiltered> unfiltereds = new ArrayList<>();
+        try (UnfilteredRowIterator iterator = read.unfilteredIterator(ColumnFilter.all(metadata), Slices.ALL, false))
+        {
+            iterator.forEachRemaining(unfiltereds::add);
+        }
+        assertEquals(3, unfiltereds.size());
+        assertTrue(unfiltereds.get(0).isRangeTombstoneMarker());
+        assertNotNull(((Row) unfiltereds.get(1)).getCell(column));
+        assertTrue(unfiltereds.get(2).isRangeTombstoneMarker());
+
+        // The closing boundary is deserialised when the cursor skips past the row and needs the deletion covering its
+        // position (the boundary's left side), and when the cursor reaches it; its tail must not add a third.
+        TrieTombstoneMarker.Covering range = TrieTombstoneMarker.covering(DELETION_TIMESTAMP, 0, TrieTombstoneMarker.Kind.RANGE);
+        TrieTombstoneMarker close = TrieTombstoneMarker.make(range, null, null);
+        assertEquals(partition.serializer.deserializedMarkers.toString(),
+                     2, Collections.frequency(partition.serializer.deserializedMarkers, close));
+    }
+
+    @Test
     public void testPrecedingStateIsNullMatchesDeserializedMarker() throws TrieSpaceExhaustedException
     {
         TrieMemtable.TrieSerializer serializer = new TrieMemtable.TrieSerializer(null, null);
@@ -197,6 +294,27 @@ public class TrieMemtableTombstoneDeserializationTest
         return row.build();
     }
 
+    /// Reads the single row with the given clustering in the given direction, skipping any range tombstone markers.
+    static Row readRow(TrieBackedPartition partition, int ck, boolean reversed)
+    {
+        Slices slices = Slices.with(metadata.comparator, Slice.make(clustering(ck)));
+        Row row = null;
+        try (UnfilteredRowIterator iterator = partition.unfilteredIterator(ColumnFilter.all(metadata), slices, reversed))
+        {
+            while (iterator.hasNext())
+            {
+                Unfiltered unfiltered = iterator.next();
+                if (unfiltered.isRow())
+                {
+                    assertNull(row);
+                    row = (Row) unfiltered;
+                }
+            }
+        }
+        assertNotNull(row);
+        return row;
+    }
+
     static PartitionUpdate rowUpdate(int ck, long timestamp)
     {
         Row.Builder row = TriePartitionUpdate.FACTORY.rowBuilder(metadata.regularColumns(), false);
@@ -207,7 +325,7 @@ public class TrieMemtableTombstoneDeserializationTest
         return update.build();
     }
 
-    /// A memtable partition trie whose serializer counts the tombstone markers it deserialises.
+    /// A memtable partition trie whose serializer counts and records the tombstone markers it deserialises.
     static class Partition
     {
         final OpOrder opOrder = new OpOrder();
@@ -262,6 +380,7 @@ public class TrieMemtableTombstoneDeserializationTest
     static class CountingSerializer extends TrieMemtable.TrieSerializer
     {
         int markersDeserialized;
+        final List<Object> deserializedMarkers = new ArrayList<>();
 
         CountingSerializer(TrieMemtable.CellDataBufferManager manager)
         {
@@ -271,9 +390,13 @@ public class TrieMemtableTombstoneDeserializationTest
         @Override
         public Object deserialize(UnsafeBuffer buffer, int inBufferPos, int offsetBits)
         {
+            Object content = super.deserialize(buffer, inBufferPos, offsetBits);
             if (offsetBits == TYPE_TOMBSTONE_MARKER_BEFORE_BRANCH || offsetBits == TYPE_TOMBSTONE_MARKER_AFTER_BRANCH)
+            {
                 ++markersDeserialized;
-            return super.deserialize(buffer, inBufferPos, offsetBits);
+                deserializedMarkers.add(content);
+            }
+            return content;
         }
     }
 }

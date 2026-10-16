@@ -42,9 +42,9 @@ public interface ContentSerializer<T> extends MemoryManager
     /// Load the content from the 32-byte cell at the given `inBufferPos` in `buffer`.
     T deserialize(UnsafeBuffer buffer, int inBufferPos, int offsetBits);
 
-    /// Returns true if the content in the 32-byte cell at the given `inBufferPos` in `buffer` is a [RangeState] whose
-    /// preceding state in the given direction is null, without deserializing it. Returning false is always correct.
-    /// See [ContentManager#precedingStateIsNull].
+    /// Returns true if the content in the 32-byte cell at the given `inBufferPos` in `buffer` is null or a [RangeState]
+    /// whose preceding state in the given direction is null, without deserializing it. Returning false is always
+    /// correct. See [ContentManager#precedingStateIsNull].
     default boolean precedingStateIsNull(UnsafeBuffer buffer, int inBufferPos, int offsetBits, Direction direction)
     {
         return false;
