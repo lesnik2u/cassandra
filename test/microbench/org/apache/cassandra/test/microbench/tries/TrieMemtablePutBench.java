@@ -132,8 +132,11 @@ public class TrieMemtablePutBench
     @Param({"16"})
     int updatesPerPartition = 16;
 
-    /// Clusterings a partition's rows are chosen from, so that rows are both inserted and overwritten.
-    static final int CLUSTERINGS_PER_PARTITION = 64;
+    /// Clusterings per partition the updates and range tombstones are drawn from. 64 models narrow partitions;
+    /// 10000 models wide partitions where each write descends a long partition branch.
+    @Param({"64", "10000"})
+    int clusteringsPerPartition;
+
     static final int RANGE_TOMBSTONE_WIDTH = 4;
     static final long BASE_TIMESTAMP = 1_700_000_000_000_000L;
 
@@ -192,7 +195,7 @@ public class TrieMemtablePutBench
         {
             long timestamp = BASE_TIMESTAMP + i;
             PartitionUpdate.Builder update = updateFactory.builder(metadata, keys[i % partitions], metadata.regularAndStaticColumns(), rowsPerUpdate);
-            int firstClustering = rand.nextInt(CLUSTERINGS_PER_PARTITION - rowsPerUpdate - RANGE_TOMBSTONE_WIDTH + 1);
+            int firstClustering = rand.nextInt(clusteringsPerPartition - rowsPerUpdate - RANGE_TOMBSTONE_WIDTH + 1);
             for (int r = 0; r < rowsPerUpdate; ++r)
             {
                 // Built the way UpdateParameters builds an UPDATE: unsorted builder, no primary key liveness.
@@ -217,7 +220,7 @@ public class TrieMemtablePutBench
             for (int i = 0; i < partitions; ++i)
             {
                 PartitionUpdate.Builder update = updateFactory.builder(metadata, keys[i], metadata.regularAndStaticColumns(), 0);
-                update.add(new RangeTombstone(Slice.make(clustering(0), clustering(CLUSTERINGS_PER_PARTITION - 1)),
+                update.add(new RangeTombstone(Slice.make(clustering(0), clustering(clusteringsPerPartition - 1)),
                                               DeletionTime.build(BASE_TIMESTAMP - 1, nowInSec)));
                 seedUpdates[i] = update.build();
             }
