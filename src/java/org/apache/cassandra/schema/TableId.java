@@ -45,6 +45,12 @@ public class TableId
     // TODO: should this be a TimeUUID?
     private final UUID id;
 
+    // Lazily computed string form of id, cached because it is requested on every read and write (sensor contexts).
+    // Not volatile: the racy initialisation is benign, as every thread computes an equal value and String is
+    // immutable and safely published through its final fields.
+    // Same idiom as java.math.BigDecimal#stringCache: a plain field, read once into a local, so no volatile is needed.
+    private String idString;
+
     private TableId(UUID id)
     {
         this.id = id;
@@ -131,7 +137,10 @@ public class TableId
     @Override
     public String toString()
     {
-        return id.toString();
+        String s = idString;
+        if (s == null)
+            idString = s = id.toString();
+        return s;
     }
 
     public void serialize(DataOutput out) throws IOException

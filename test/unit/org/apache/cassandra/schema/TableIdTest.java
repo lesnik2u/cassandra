@@ -18,12 +18,15 @@
 
 package org.apache.cassandra.schema;
 
+import java.util.UUID;
+
 import org.junit.Test;
 
 import org.apache.cassandra.utils.Pair;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertSame;
 
 public class TableIdTest
 {
@@ -35,5 +38,16 @@ public class TableIdTest
         assertNotNull(tableNameAndId);
         assertEquals("cf", tableNameAndId.left);
         assertEquals(tableId, tableNameAndId.right);
+    }
+
+    @Test
+    public void testToStringIsCached()
+    {
+        UUID uuid = UUID.randomUUID();
+        TableId tableId = TableId.fromUUID(uuid);
+        String first = tableId.toString();
+        assertEquals(uuid.toString(), first);
+        assertSame(first, tableId.toString());
+        assertEquals(TableId.fromString(first), tableId);
     }
 }
