@@ -31,6 +31,7 @@ import org.junit.runners.Parameterized;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.ServerTestUtils;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
@@ -50,6 +51,10 @@ import org.apache.cassandra.utils.CassandraVersion;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.apache.cassandra.utils.concurrent.Refs;
+import org.apache.cassandra.utils.memory.NativePool;
+
+import static org.apache.cassandra.db.memtable.ValueStorageTestSupport.assertValueStorage;
+import static org.apache.cassandra.db.memtable.ValueStorageTestSupport.isAccepted;
 
 @RunWith(Parameterized.class)
 public class MemtableQuickTest extends CQLTester
@@ -71,6 +76,9 @@ public class MemtableQuickTest extends CQLTester
     @Parameterized.Parameters(name = "{0}")
     public static List<Object> parameters()
     {
+        // MEMORY_POOL below needs the configuration loaded; parameters are computed before @BeforeClass runs
+        ServerTestUtils.daemonInitialization();
+
         // Sharded memtables require Cassandra 5.0+, skip them in compatibility mode
         StorageCompatibilityMode mode = DatabaseDescriptor.getStorageCompatibilityMode();
         boolean skipSharded = mode != null && mode.isBefore(CassandraVersion.CASSANDRA_5_0.major);
@@ -83,6 +91,10 @@ public class MemtableQuickTest extends CQLTester
             params.add("skiplist_sharded_locking");
         }
         params.add("trie");
+        if (AbstractAllocatorMemtable.MEMORY_POOL instanceof NativePool)
+            params.add("trie_file");
+        if (isAccepted(TrieMemtable.ValueStorage.COMMITLOG))
+            params.add("trie_commitlog");
         params.add("trie_stage1");
         params.add("trie_stage2",
                                 "trie_stage3",
@@ -114,6 +126,7 @@ public class MemtableQuickTest extends CQLTester
         String writeStatement = "INSERT INTO "+table+"(userid,picid,commentid)VALUES(?,?,?)";
 
         ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore(table);
+        assertValueStorage(memtableClass, cfs);
         cfs.disableAutoCompaction();
         Util.flush(cfs);
 

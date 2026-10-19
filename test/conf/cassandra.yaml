@@ -89,6 +89,16 @@ memtable:
             class_name: TrieMemtable
             parameters:
                 shards: 4
+        trie_file:
+            class_name: TrieMemtable
+            parameters:
+                shards: 4
+                value_storage: file
+        trie_commitlog:
+            class_name: TrieMemtable
+            parameters:
+                shards: 4
+                value_storage: commitlog
         trie_stage1:
             class_name: TrieMemtableStage1
         trie_stage2:

@@ -43,19 +43,21 @@ import static org.apache.cassandra.db.partitions.PartitionUpdate.Factory;
 public class TrieMemtableFactory implements Memtable.Factory
 {
     final Integer shardCount;
+    final TrieMemtable.ValueStorage valueStorage;
 
-    TrieMemtableFactory(Integer shardCount)
+    TrieMemtableFactory(Integer shardCount, TrieMemtable.ValueStorage valueStorage)
     {
         this.shardCount = shardCount;
+        this.valueStorage = valueStorage;
     }
 
     @Override
     public Memtable create(AtomicReference<CommitLogPosition> commitLogLowerBound, TableMetadataRef metadaRef, Memtable.Owner owner)
     {
-        return new TrieMemtable(commitLogLowerBound, metadaRef, owner, shardCount);
+        return new TrieMemtable(commitLogLowerBound, metadaRef, owner, shardCount, valueStorage);
     }
 
-    public static final TrieMemtableFactory INSTANCE = new TrieMemtableFactory(null);
+    public static final TrieMemtableFactory INSTANCE = new TrieMemtableFactory(null, TrieMemtable.ValueStorage.NATIVE);
     public static InheritingClass CONFIGURATION = new InheritingClass(null, TrieMemtable.class.getName(), ImmutableMap.of());
 
     @Override
@@ -81,11 +83,12 @@ public class TrieMemtableFactory implements Memtable.Factory
         if (o == null || getClass() != o.getClass())
             return false;
         TrieMemtableFactory factory = (TrieMemtableFactory) o;
-        return Objects.equals(shardCount, factory.shardCount);
+        return Objects.equals(shardCount, factory.shardCount)
+               && valueStorage == factory.valueStorage;
     }
 
     public int hashCode()
     {
-        return Objects.hash(shardCount);
+        return Objects.hash(shardCount, valueStorage);
     }
 }

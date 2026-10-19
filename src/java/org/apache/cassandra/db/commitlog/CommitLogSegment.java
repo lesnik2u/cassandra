@@ -84,8 +84,11 @@ public abstract class CommitLogSegment
         }
     }
 
+    // The bytes of a commit log entry before its mutation (int: length + int: head checksum)
+    static final int ENTRY_HEADER_SIZE = 4 + 4;
+
     // The commit log entry overhead in bytes (int: length + int: head checksum + int: tail checksum)
-    public static final int ENTRY_OVERHEAD_SIZE = 4 + 4 + 4;
+    public static final int ENTRY_OVERHEAD_SIZE = ENTRY_HEADER_SIZE + 4;
 
     // The commit log (chained) sync marker/header size in bytes (int: length + int: checksum [segmentId, position])
     static final int SYNC_MARKER_SIZE = 4 + 4;
@@ -696,6 +699,12 @@ public abstract class CommitLogSegment
         CommitLogSegment getSegment()
         {
             return segment;
+        }
+
+        /// The position in the segment at the start of this allocation.
+        int getPosition()
+        {
+            return position;
         }
 
         ByteBuffer getBuffer()

@@ -25,9 +25,14 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.DeletionPurger;
 import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.db.commitlog.SerializedValueOffsets;
+import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.ValueAccessor;
 import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.io.util.TeeDataInputPlus;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.utils.memory.ByteBufferCloner;
@@ -213,7 +218,37 @@ public abstract class Cell<V> extends ColumnData implements CellData<V, Cell<?>>
                 column.cellPathSerializer().serialize(cell.path(), out);
 
             if (hasValue)
-                header.getType(column).writeValue(cell.value(), cell.accessor(), out);
+            {
+                AbstractType<?> type = header.getType(column);
+                if (SerializedValueOffsets.ENABLED && cell.valueSize() >= SerializedValueOffsets.MIN_RECORDED_LENGTH)
+                    recordSerializedValue(cell, type, out);
+                type.writeValue(cell.value(), cell.accessor(), out);
+            }
+        }
+
+        /// Records where `cell`'s value is about to be written in `out`, if `out` is a [DataOutputBuffer] with a
+        /// [DataOutputBuffer#recorder].
+        private static void recordSerializedValue(Cell<?> cell, AbstractType<?> type, DataOutputPlus out)
+        {
+            SerializedValueOffsets offsets = out instanceof DataOutputBuffer ? ((DataOutputBuffer) out).recorder : null;
+            if (offsets == null)
+                return;
+            int length = cell.valueSize();
+            int lengthPrefix = type.isValueLengthFixed() ? 0 : TypeSizes.sizeofUnsignedVInt(length);
+            // the position of a DataOutputBuffer is the number of bytes written to it
+            offsets.recordValue(cell.value(), length, (int) out.position() + lengthPrefix);
+        }
+
+        /// Records where `value`, just read from `in`, sits in the bytes `in` has copied so far, if `in` is a
+        /// [TeeDataInputPlus] with a [TeeDataInputPlus#recorder].
+        private static <V> void recordDeserializedValue(V value, ValueAccessor<V> accessor, DataInputPlus in)
+        {
+            SerializedValueOffsets offsets = in instanceof TeeDataInputPlus ? ((TeeDataInputPlus) in).recorder : null;
+            if (offsets == null)
+                return;
+            int length = accessor.size(value);
+            // the value bytes are the last ones read, so they end at the current position of the copy
+            offsets.recordValue(value, length, (int) ((TeeDataInputPlus) in).teePosition() - length);
         }
 
         public <V> Cell<V> deserialize(DataInputPlus in, LivenessInfo rowLiveness, ColumnMetadata column, SerializationHeader header, DeserializationHelper helper, ValueAccessor<V> accessor) throws IOException
@@ -249,6 +284,9 @@ public abstract class Cell<V> extends ColumnData implements CellData<V, Cell<?>>
                     boolean isCounter = localDeletionTime == NO_DELETION_TIME && column.type.isCounter();
 
                     value = header.getType(column).read(accessor, in, DatabaseDescriptor.getMaxValueSize());
+                    // recorded before maybeClearCounterValue, which may return a copy whose bytes are not in the input
+                    if (SerializedValueOffsets.ENABLED && accessor.size(value) >= SerializedValueOffsets.MIN_RECORDED_LENGTH)
+                        recordDeserializedValue(value, accessor, in);
                     if (isCounter)
                         value = helper.maybeClearCounterValue(value, accessor);
                 }

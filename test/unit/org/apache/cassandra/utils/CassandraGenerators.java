@@ -41,6 +41,7 @@ import org.apache.commons.lang3.builder.MultilineRecursiveToStringStyle;
 import org.apache.commons.lang3.builder.ReflectionToStringBuilder;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.InheritingClass;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.Duration;
 import org.apache.cassandra.cql3.FieldIdentifier;
@@ -54,6 +55,7 @@ import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.marshal.EmptyType;
 import org.apache.cassandra.db.marshal.TimeUUIDType;
 import org.apache.cassandra.db.marshal.UserType;
+import org.apache.cassandra.db.memtable.TrieMemtable;
 import org.apache.cassandra.db.rows.CellData;
 import org.apache.cassandra.dht.ByteOrderedPartitioner;
 import org.apache.cassandra.dht.IPartitioner;
@@ -208,6 +210,9 @@ public final class CassandraGenerators
             // Also filter out CC5-only types (sharded memtables) when in HCD_1/CC4 mode
             List<String> valid = known.stream()
                                       .filter(name -> !name.startsWith("test_"))
+                                      // file and commitlog value storage require offheap_objects, and commitlog also an uncompressed,
+                                      // unencrypted mmap commit log, which not every test configuration has
+                                      .filter(name -> isNativeValueStorage(memtableParameter(name, TrieMemtable.VALUE_STORAGE_OPTION)))
                                       .filter(name -> {
                                           // Filter out sharded memtables when in CC4 compatibility mode
                                           if (DatabaseDescriptor.getStorageCompatibilityMode().isBefore(org.apache.cassandra.utils.CassandraVersion.CASSANDRA_5_0.major))
@@ -217,6 +222,27 @@ public final class CassandraGenerators
                                       .collect(Collectors.toList());
             memtableKeyGen = SourceDSL.arbitrary().pick(valid);
             return this;
+        }
+
+        /// The parameter `parameter` of the memtable configuration `name`, following its `inherits` chain, or null.
+        private static String memtableParameter(String name, String parameter)
+        {
+            Map<String, InheritingClass> configurations = DatabaseDescriptor.getMemtableConfigurations();
+            if (configurations == null)
+                return null;
+            for (InheritingClass configuration = configurations.get(name);
+                 configuration != null;
+                 configuration = configuration.inherits == null ? null : configurations.get(configuration.inherits))
+            {
+                if (configuration.parameters != null && configuration.parameters.containsKey(parameter))
+                    return configuration.parameters.get(parameter);
+            }
+            return null;
+        }
+
+        private static boolean isNativeValueStorage(String valueStorage)
+        {
+            return valueStorage == null || valueStorage.trim().equalsIgnoreCase(TrieMemtable.ValueStorage.NATIVE.name());
         }
 
         public TableMetadataBuilder withKeyspaceName(Gen<String> ksNameGen)

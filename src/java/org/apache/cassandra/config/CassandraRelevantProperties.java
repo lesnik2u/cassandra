@@ -638,6 +638,9 @@ public enum CassandraRelevantProperties
     MEMTABLE_RECLAIM_THREADS("cassandra.memtable_reclaim_threads", "1"),
     MEMTABLE_SHARD_COUNT("cassandra.memtable.shard.count"),
     MEMTABLE_TRIE_SIZE_LIMIT("cassandra.trie_size_limit_mb"),
+    /// Whether a commit-log-backed memtable value store compares the segment bytes with the value before referencing
+    /// them. Costs a comparison per referenced value on the write path; the unit tests turn it on.
+    MEMTABLE_VALUE_LOG_VERIFY("cassandra.memtable_value_log_verify", "false"),
     MIGRATION_DELAY("cassandra.migration_delay_ms", "60000"),
     MMAPPED_MAX_SEGMENT_SIZE_IN_MB("cassandra.mmapped_max_segment_size"),
     /**

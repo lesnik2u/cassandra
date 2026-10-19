@@ -28,6 +28,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 
 import io.netty.util.concurrent.FastThreadLocal;
+import org.apache.cassandra.db.commitlog.SerializedValueOffsets;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.DATA_OUTPUT_BUFFER_ALLOCATE_TYPE;
@@ -90,6 +91,12 @@ public class DataOutputBuffer extends BufferedDataOutputStreamPlus
             };
         }
     };
+
+    /// While not null, records where the cell values serialized into this buffer are written. Set by the serialization
+    /// that owns the buffer, which restores the previous value when it completes. The recorded offsets are this
+    /// buffer's [#position()], which [org.apache.cassandra.db.rows.Cell] takes as relative to the start of the
+    /// serialization: the buffer must be empty when recording starts, as the scratch buffer is.
+    public SerializedValueOffsets recorder;
 
     public DataOutputBuffer()
     {

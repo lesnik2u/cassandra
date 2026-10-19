@@ -29,6 +29,7 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.RegularAndStaticColumns;
+import org.apache.cassandra.db.WriteContext;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.partitions.BTreePartitionUpdate;
@@ -223,6 +224,19 @@ public interface Memtable extends Comparable<Memtable>, UnfilteredSource, CellSo
      */
     long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup);
 
+    /// As [#put(PartitionUpdate, UpdateTransaction, OpOrder.Group)], given the context of the write, which may be null.
+    /// An implementation may use it, e.g. to refer to where the update's values were written in the commit log instead
+    /// of copying them; the default ignores it.
+    ///
+    /// An implementation that uses the context must also override
+    /// [#checkSpaceAndPut(PartitionUpdate, UpdateTransaction, OpOrder.Group, WriteContext)], through which the
+    /// outermost write of a mutation arrives: its default calls the 3-argument `checkSpaceAndPut`, which drops the
+    /// context. [AbstractAllocatorMemtable] does so.
+    default long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup, WriteContext context)
+    {
+        return put(update, indexer, opGroup);
+    }
+
     /**
      * Put variant for writes performed inside an already-started mutation on the same
      * thread, e.g. legacy 2i applying to its index table's memtable from
@@ -277,6 +291,14 @@ public interface Memtable extends Comparable<Memtable>, UnfilteredSource, CellSo
     default long checkSpaceAndPut(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
     {
         return put(update, indexer, opGroup);
+    }
+
+    /// As [#checkSpaceAndPut(PartitionUpdate, UpdateTransaction, OpOrder.Group)], given the context of the write,
+    /// which may be null; see [#put(PartitionUpdate, UpdateTransaction, OpOrder.Group, WriteContext)]. The default
+    /// ignores it.
+    default long checkSpaceAndPut(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup, WriteContext context)
+    {
+        return checkSpaceAndPut(update, indexer, opGroup);
     }
 
     // Read operations are provided by the UnfilteredSource interface.

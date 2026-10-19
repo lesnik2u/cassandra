@@ -22,6 +22,7 @@ import java.io.EOFException;
 import java.io.IOException;
 
 import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.db.commitlog.SerializedValueOffsets;
 import org.apache.cassandra.utils.Throwables;
 
 /**
@@ -38,6 +39,12 @@ public class TeeDataInputPlus implements DataInputPlus
 
     private final long limit;
     private boolean limitReached;
+
+    /// While not null, records where the cell values read through this input are in the tee buffer. Set by the
+    /// deserialization that creates this input. It is never cleared, which is safe only because this input does not
+    /// escape [org.apache.cassandra.db.Mutation.MutationSerializer#deserialize] (partition updates are deserialized
+    /// eagerly); anything reading from it lazily would record into a published offsets object.
+    public SerializedValueOffsets recorder;
 
     public TeeDataInputPlus(DataInputPlus source, DataOutputPlus teeBuffer)
     {
@@ -212,6 +219,13 @@ public class TeeDataInputPlus implements DataInputPlus
             for (int i = 0; i < n; i++)
                 teeBuffer.writeByte(0);
         });
+    }
+
+    /// The current position of the tee buffer, which advances by every byte read through this input while
+    /// [#isLimitReached()] is false.
+    public long teePosition()
+    {
+        return teeBuffer.position();
     }
 
     /**

@@ -29,6 +29,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableCollection;
 import com.google.common.collect.ImmutableMap;
@@ -38,6 +39,7 @@ import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.commitlog.CommitLog;
+import org.apache.cassandra.db.commitlog.SerializedValueOffsets;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.rows.DeserializationHelper;
 import org.apache.cassandra.io.IVersionedSerializer;
@@ -497,6 +499,16 @@ public class Mutation implements IMutation, Supplier<Mutation>
             serialization(mutation, version).serialize(partitionUpdateSerializer, mutation, out, version);
         }
 
+        /// Serializes `mutation` as [#serialize] does, and returns the offsets of the values in the serialization it
+        /// wrote, or null if that serialization is not cached (too large), was built without recording offsets
+        /// (recording not enabled), or has no value long enough to be recorded.
+        public SerializedValueOffsets serializeWithOffsets(Mutation mutation, DataOutputPlus out, int version) throws IOException
+        {
+            Serialization serialization = serialization(mutation, version);
+            serialization.serialize(partitionUpdateSerializer, mutation, out, version);
+            return serialization.offsets();
+        }
+
         /**
          * Called early during request processing to prevent that {@link #serialization(Mutation, int)} is
          * called concurrently.
@@ -533,10 +545,25 @@ public class Mutation implements IMutation, Supplier<Mutation>
                 // so we only cache serialized mutations when they are below the defined limit.
                 if (serializedSize < CACHEABLE_MUTATION_SIZE_LIMIT)
                 {
+                    SerializedValueOffsets offsets = SerializedValueOffsets.ENABLED ? new SerializedValueOffsets() : null;
                     try (DataOutputBuffer dob = DataOutputBuffer.scratchBuffer.get())
                     {
-                        serializeInternal(partitionUpdateSerializer, mutation, dob, version);
-                        serialization = new CachedSerialization(dob.toByteArray());
+                        // The commit log appends through this thread's scratch buffer and gets here for an
+                        // uncached mutation while that buffer is still empty, so this serialization is written into
+                        // the same buffer, which closing it clears. Restoring the recorder keeps the commit log's
+                        // (null) intact.
+                        SerializedValueOffsets previous = dob.recorder;
+                        dob.recorder = offsets;
+                        try
+                        {
+                            serializeInternal(partitionUpdateSerializer, mutation, dob, version);
+                        }
+                        finally
+                        {
+                            dob.recorder = previous;
+                        }
+                        byte[] serialized = dob.toByteArray();
+                        serialization = new CachedSerialization(serialized, offsets != null ? offsets.finish(serialized) : null);
                     }
                     catch (IOException e)
                     {
@@ -571,9 +598,11 @@ public class Mutation implements IMutation, Supplier<Mutation>
         {
             Mutation m;
             TeeDataInputPlus teeIn;
+            SerializedValueOffsets offsets = SerializedValueOffsets.ENABLED ? new SerializedValueOffsets() : null;
             try (DataOutputBuffer dob = DataOutputBuffer.scratchBuffer.get())
             {
                 teeIn = new TeeDataInputPlus(in, dob, CACHEABLE_MUTATION_SIZE_LIMIT);
+                teeIn.recorder = offsets;
 
                 int size = teeIn.readUnsignedVInt32();
                 assert size > 0;
@@ -599,7 +628,10 @@ public class Mutation implements IMutation, Supplier<Mutation>
 
                 //Only cache serializations that don't hit the limit
                 if (!teeIn.isLimitReached())
-                    m.cachedSerializations[MessagingService.getVersionOrdinal(version)] = new CachedSerialization(dob.toByteArray());
+                {
+                    byte[] serialized = dob.toByteArray();
+                    m.cachedSerializations[MessagingService.getVersionOrdinal(version)] = new CachedSerialization(serialized, offsets != null ? offsets.finish(serialized) : null);
+                }
 
                 return m;
             }
@@ -614,6 +646,15 @@ public class Mutation implements IMutation, Supplier<Mutation>
         {
             return serialization(mutation, version).serializedSize(partitionUpdateSerializer, mutation, version);
         }
+
+        /// The offsets of the values in the cached serialization of `mutation` for `version`, or null if it has not
+        /// been built yet; see [#serializeWithOffsets] for when else it is null.
+        @VisibleForTesting
+        public SerializedValueOffsets offsetsFor(Mutation mutation, int version)
+        {
+            Serialization serialization = mutation.cachedSerializations[MessagingService.getVersionOrdinal(version)];
+            return serialization == null ? null : serialization.offsets();
+        }
     }
 
     /**
@@ -626,6 +667,11 @@ public class Mutation implements IMutation, Supplier<Mutation>
         abstract void serialize(PartitionUpdate.PartitionUpdateSerializer serializer, Mutation mutation, DataOutputPlus out, int version) throws IOException;
 
         abstract long serializedSize(PartitionUpdate.PartitionUpdateSerializer serializer, Mutation mutation, int version);
+
+        SerializedValueOffsets offsets()
+        {
+            return null;
+        }
     }
 
     /**
@@ -634,10 +680,13 @@ public class Mutation implements IMutation, Supplier<Mutation>
     private static final class CachedSerialization extends Serialization
     {
         private final byte[] serialized;
+        // where the values sit in serialized, or null if none was recorded
+        private final SerializedValueOffsets offsets;
 
-        CachedSerialization(byte[] serialized)
+        CachedSerialization(byte[] serialized, SerializedValueOffsets offsets)
         {
             this.serialized = Preconditions.checkNotNull(serialized);
+            this.offsets = offsets;
         }
 
         @Override
@@ -650,6 +699,12 @@ public class Mutation implements IMutation, Supplier<Mutation>
         long serializedSize(PartitionUpdate.PartitionUpdateSerializer serializer, Mutation mutation, int version)
         {
             return serialized.length;
+        }
+
+        @Override
+        SerializedValueOffsets offsets()
+        {
+            return offsets;
         }
     }
 

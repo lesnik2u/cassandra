@@ -31,6 +31,7 @@ import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.WriteContext;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.index.transactions.UpdateTransaction;
@@ -151,8 +152,14 @@ public abstract class AbstractAllocatorMemtable extends AbstractMemtableWithComm
     @Override
     public final long checkSpaceAndPut(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
     {
+        return checkSpaceAndPut(update, indexer, opGroup, null);
+    }
+
+    @Override
+    public final long checkSpaceAndPut(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup, WriteContext context)
+    {
         allocator.awaitRoomToStart(opGroup);
-        return put(update, indexer, opGroup);
+        return put(update, indexer, opGroup, context);
     }
 
     @Override

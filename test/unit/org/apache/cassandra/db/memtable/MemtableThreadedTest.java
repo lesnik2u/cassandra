@@ -34,13 +34,17 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
+import org.apache.cassandra.ServerTestUtils;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.utils.memory.NativePool;
 
 import static org.apache.cassandra.db.ColumnFamilyStore.FlushReason.UNIT_TESTS;
+import static org.apache.cassandra.db.memtable.ValueStorageTestSupport.assertValueStorage;
+import static org.apache.cassandra.db.memtable.ValueStorageTestSupport.isAccepted;
 
 /// This test is a counterpart to InMemoryTrieConsistencyTest that makes sure TrieMemtable is wiring the trie consistency
 /// machinery correctly. Note that this test always applies mutations the same way (with partition-level forced copying)
@@ -56,13 +60,22 @@ public class MemtableThreadedTest extends CQLTester
     @Parameterized.Parameters(name = "{0}")
     public static List<Object> parameters()
     {
-        return ImmutableList.of("skiplist",
-                                "skiplist_sharded",
-                                "trie",
-                                "trie_stage1",
-                                "trie_stage2",
-                                "trie_stage3",
-                                "persistent_memory");
+        // MEMORY_POOL below needs the configuration loaded; parameters are computed before @BeforeClass runs
+        ServerTestUtils.daemonInitialization();
+
+        ImmutableList.Builder<Object> params = ImmutableList.builder();
+        params.add("skiplist",
+                   "skiplist_sharded",
+                   "trie");
+        if (AbstractAllocatorMemtable.MEMORY_POOL instanceof NativePool)
+            params.add("trie_file");
+        if (isAccepted(TrieMemtable.ValueStorage.COMMITLOG))
+            params.add("trie_commitlog");
+        params.add("trie_stage1",
+                   "trie_stage2",
+                   "trie_stage3",
+                   "persistent_memory");
+        return params.build();
     }
 
     @BeforeClass
@@ -186,6 +199,7 @@ public class MemtableThreadedTest extends CQLTester
         execute("use " + keyspace + ';');
 
         cfs = Keyspace.open(keyspace).getColumnFamilyStore(table);
+        assertValueStorage(memtableClass, cfs);
         cfs.disableAutoCompaction();
         cfs.forceBlockingFlush(UNIT_TESTS);
 

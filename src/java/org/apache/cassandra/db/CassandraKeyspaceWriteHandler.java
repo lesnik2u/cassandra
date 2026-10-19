@@ -22,8 +22,6 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
-import org.apache.cassandra.db.commitlog.CommitLog;
-import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.index.Index;
@@ -57,12 +55,16 @@ public class CassandraKeyspaceWriteHandler implements KeyspaceWriteHandler
                 prepared = prepareIndexWrites(mutation, writeOptions);
 
             // write the mutation to the commitlog and memtables
-            CommitLogPosition position = null;
             if (writeOptions.shouldWriteCommitLog(mutation.getKeyspaceName()))
             {
-                position = addToCommitLog(mutation);
+                Mutation logged = mutationForCommitLog(mutation);
+                if (logged != null)
+                {
+                    Tracing.trace("Appending to commitlog");
+                    return CassandraWriteContext.addToCommitLog(group, logged, writeOptions, mutation.origin(), prepared);
+                }
             }
-            return new CassandraWriteContext(group, position, writeOptions, mutation.origin(), prepared);
+            return new CassandraWriteContext(group, null, writeOptions, mutation.origin(), prepared);
         }
         catch (Throwable t)
         {
@@ -99,7 +101,8 @@ public class CassandraKeyspaceWriteHandler implements KeyspaceWriteHandler
         return prepared;
     }
 
-    private CommitLogPosition addToCommitLog(Mutation mutation)
+    /// `mutation` without the updates of the tables that skip the commit log, or null if all do.
+    private Mutation mutationForCommitLog(Mutation mutation)
     {
         // Usually one of these will be true, so first check if that's the case.
         boolean allSkipCommitlog = true;
@@ -130,8 +133,7 @@ public class CassandraKeyspaceWriteHandler implements KeyspaceWriteHandler
         // Note: It may be a good idea to precalculate none/all for the set of all tables in the keyspace,
         // or memoize the mutation.getTableIds()->ids map (needs invalidation on schema version change).
 
-        Tracing.trace("Appending to commitlog");
-        return CommitLog.instance.add(mutation);
+        return mutation;
     }
 
     private WriteContext createEmptyContext()

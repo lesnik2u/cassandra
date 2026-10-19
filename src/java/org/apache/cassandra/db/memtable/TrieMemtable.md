@@ -520,7 +520,7 @@ Externally-stored value of cells use `offsetBits == 0x1A` and the following cont
 | 0     | is counter                   | 00                | non-counter              |
 | 1-3   | _unused_                     |                   |                          |
 | 4-7   | value length                 | 20                | 32 bytes                 |
-| 8-15  | external value handle        | 12345678 90ABCDEF | address in direct memory |
+| 8-15  | external value handle        | 12345678 90ABCDEF | opaque handle interpreted by the cell data manager: native address, slab buffer id, or value-store handle |
 | 16-19 | ttl                          | 00000000          | NO_TTL                   |
 | 20-23 | unsigned local deletion time | FFFFFFFF          | NO_EXPIRATION_TIME       |
 | 24-31 | timestamp                    | 00000000 0000016C | 364                      |
@@ -594,6 +594,87 @@ objects and maps them into integer handles. To store, we ask the allocator for a
 it to the content manager and save the id it returns in the handle field. To read, we get the id from
 the handle field and ask the manager for the buffer. In this mode of operation every large cell has 
 additional on-heap presence in the form of one byte buffer and a list entry for it.
+
+### Values outside memtable memory
+
+With the experimental `value_storage` options `file` and `commitlog` (both require `offheap_objects`), values that
+don't fit are not stored in memtable memory. Each shard keeps them in its own value store, and the handle is opaque to
+everything but that store. A value that is overwritten is not released; all of a store's storage is released at once
+when the memtable is discarded. Counter values are stored there too.
+
+The memtable still charges the value bytes its store holds to its off-heap memory, as if they were in it: the shard
+counts the store's written bytes as part of the trie's off-heap size, so that the adjustment it makes after each
+update charges them to its allocator, and they are released with the rest of the memtable's memory when it is
+discarded. The memtable memory limit therefore covers them with no separate mechanism: the cleaner flushes the
+memtable owning the most (`MEMTABLE_LIMIT`), and writes wait for room once the pool is full. This has consequences:
+- A `file` or `commitlog` table flushes at the same value volume as a `native` one unless `memtable_offheap_space` is
+  raised, and raising it raises the memory ceiling of the `native` tables too.
+- The table metrics `MemtableOffHeapDataSize` and `AllMemtablesOffHeapDataSize` (formerly `MemtableOffHeapSize` and
+  `AllMemtablesOffHeapSize`) and the memtable pool gauges include value bytes that are on disk and in the page cache
+  rather than in memtable memory.
+
+Common to both:
+- A memtable that has been switched out keeps its files until it is flushed and discarded.
+- A full disk surfaces as an `InternalError` (from a SIGBUS) in the writing thread rather than as an `FSWriteError`.
+- Files left behind by a crash are deleted when the first memtable with `file` or `commitlog` value storage is created
+  after the restart. If the option is removed after a crash, `memtable_values/*.values` must be deleted by hand.
+
+#### `file` value storage
+
+Each shard appends the values to a memory-mapped, append-only file under `<commitlog_directory>/memtable_values`, and
+the handle is the value's offset in that file. The whole file is unmapped and deleted when the memtable is discarded.
+
+Every appended value is charged, overwritten ones included, so the files of all memtables together are bounded by
+`memtable_offheap_space`, less what the memtables keep in memory, plus what the mutations in flight add: the limit is
+checked when a write starts, not as it appends.
+
+A file grows in regions of `FileValueStore.REGION_SIZE` (currently 64 MiB) and is sparse. The first write to each
+page of a freshly mapped region takes a page fault, which for large values dominates the cost of a put and is paid
+under the shard's write lock. Pre-faulting the next region on a background thread was tried and rejected: it measured
+no faster and made the files non-sparse.
+
+Under saturating write load, puts are bound by dirty page writeback, while the RAM used per stored value byte drops
+by orders of magnitude for large values; the accounted memtable memory does not.
+
+#### `commitlog` value storage
+
+A value is not copied at all when it can be found where the write put it in the commit log: the commit log records
+where each value of a mutation lands in the serialized entry, the write passes those locations to the memtable, and
+the handle refers to the value's bytes in a read-only mapping of the commit log segment, shared by all memtables that
+refer to that segment. Before it refers to a value, the memtable compares the first and last eight bytes of the value
+with the bytes at the recorded location in the serialized entry; a mismatch copies the value instead and is logged at
+most once a minute. This check validates the value's offset inside the serialized mutation against the cached
+serialization only; the translation of that offset to the segment offset (`entryStart`) is checked only under the
+test-time verify property.
+
+Values that cannot be found there are copied into a per-shard file as with `file`: commit log replay, writes that skip
+the commit log (`durable_writes=false` or a memtable that does not write to it), values rebuilt after the mutation was
+serialized, such as a counter context merged from the shards of several replicas (a local increment keeps the context
+it wrote and is referenced), and mutations too large for their serialized form to be cached. `Value log fallback bytes`
+in the TrieMemtable metrics counts them. A legacy secondary index write nested in a base table write is given the base
+write's locations; they can only find a value of the index update that is the very buffer the base write serialized,
+whose bytes are then the ones in the segment.
+
+The memtable is charged for the value bytes it relies on in the page cache, referenced and copied alike: the same
+budget as `file`.
+
+The commit log keeps a segment until every memtable with data in it has flushed, so referring to a segment holds no
+disk space the commit log would not hold anyway. Only between the flush of a memtable and its discard may the commit
+log delete or archive a segment the memtable still maps; the mapping keeps the bytes readable for the reads still in
+flight, and the space is freed when the memtable is discarded. Meanwhile `df` reports more space in use than the files
+in the commit log directory add up to, and `lsof` lists the segments as `(deleted)`.
+
+This requires an uncompressed, unencrypted commit log with `commitlog_disk_access_mode: mmap`, as only then are the
+written bytes in the segment file immediately; with any other commit log configuration a table cannot be created or
+altered to use it, and a table loaded with it uses the default memtable. Note that `commitlog_disk_access_mode: auto`
+(the `cassandra_latest.yaml` default) resolves to `direct` on nodes whose commit log disk supports direct I/O and that
+use the `ssd` disk optimization strategy, so `commitlog` is rejected there; set `legacy` or `mmap` instead. If the
+commit log no longer meets these conditions when a memtable is created, nothing breaks: every value is copied, as the
+fallback gauge shows. Offline tools do not check the commit log configuration.
+
+Once a node has accepted `commitlog` for any table, every mutation it serializes for the commit log records where
+its values are, whatever its table, until the node restarts: dropping the table or altering it to another value
+storage does not turn the recording off. Offline tools never turn it on.
 
 ## Other key points
 

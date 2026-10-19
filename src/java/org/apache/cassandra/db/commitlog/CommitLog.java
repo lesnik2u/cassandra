@@ -70,6 +70,7 @@ import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
 
 import static org.apache.cassandra.db.ColumnFamilyStore.FlushReason.STARTUP;
 import static org.apache.cassandra.db.commitlog.CommitLogSegment.Allocation;
+import static org.apache.cassandra.db.commitlog.CommitLogSegment.ENTRY_HEADER_SIZE;
 import static org.apache.cassandra.db.commitlog.CommitLogSegment.ENTRY_OVERHEAD_SIZE;
 import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 import static org.apache.cassandra.utils.FBUtilities.updateChecksum;
@@ -389,6 +390,53 @@ public class CommitLog implements CommitLogMBean
      */
     public CommitLogPosition add(Mutation mutation) throws CDCWriteException
     {
+        int storageVersion = checkCanAdd(mutation);
+        try (DataOutputBuffer dob = DataOutputBuffer.scratchBuffer.get())
+        {
+            Mutation.serializer.serialize(mutation, dob, storageVersion);
+            return append(mutation, dob).getCommitLogPosition();
+        }
+        catch (IOException e)
+        {
+            throw new FSWriteError(e, segmentManager.allocatingFrom().getPath());
+        }
+    }
+
+    /// The result of [#addWithLocations]: the position after the entry, and where its values sit in the segment.
+    public static final class Added
+    {
+        public final CommitLogPosition position;
+        /// Null unless the entry has recorded values and went to a [MemoryMappedSegment].
+        public final CommitLogValueLocations locations;
+
+        Added(CommitLogPosition position, CommitLogValueLocations locations)
+        {
+            this.position = position;
+            this.locations = locations;
+        }
+    }
+
+    /// Adds `mutation` to the commit log, as [#add], and also returns where its values were written. The locations are
+    /// only known for the values recorded in the mutation's cached serialization (see
+    /// [Mutation.MutationSerializer#serializeWithOffsets]); [Added#locations] is null when there is none.
+    public Added addWithLocations(Mutation mutation) throws CDCWriteException
+    {
+        int storageVersion = checkCanAdd(mutation);
+        try (DataOutputBuffer dob = DataOutputBuffer.scratchBuffer.get())
+        {
+            SerializedValueOffsets relative = Mutation.serializer.serializeWithOffsets(mutation, dob, storageVersion);
+            Allocation alloc = append(mutation, dob);
+            return new Added(alloc.getCommitLogPosition(), valueLocations(alloc, relative));
+        }
+        catch (IOException e)
+        {
+            throw new FSWriteError(e, segmentManager.allocatingFrom().getPath());
+        }
+    }
+
+    /// Checks that `mutation` can be added and returns the messaging version to serialize it with.
+    private int checkCanAdd(Mutation mutation)
+    {
         assert mutation != null;
 
         int storageVersion = StorageCompatibilityMode.current().storageMessagingVersion();
@@ -400,44 +448,58 @@ public class CommitLog implements CommitLogMBean
             noSpamLogger.error(errorMsg);
             throw new FSWriteError(new IllegalStateException(errorMsg), segmentManager.allocatingFrom().getPath());
         }
+        return storageVersion;
+    }
 
-        try (DataOutputBuffer dob = DataOutputBuffer.scratchBuffer.get())
+    /// Writes `mutation`, serialized in `dob`, as an entry of the current segment.
+    private Allocation append(Mutation mutation, DataOutputBuffer dob)
+    {
+        int size = dob.getLength();
+        int totalSize = size + ENTRY_OVERHEAD_SIZE;
+        Allocation alloc = segmentManager.allocate(mutation, totalSize);
+
+        CRC32 checksum = new CRC32();
+        final ByteBuffer buffer = alloc.getBuffer();
+        try (BufferedDataOutputStreamPlus dos = new DataOutputBufferFixed(buffer))
         {
-            Mutation.serializer.serialize(mutation, dob, storageVersion);
-            int size = dob.getLength();
-            int totalSize = size + ENTRY_OVERHEAD_SIZE;
-            Allocation alloc = segmentManager.allocate(mutation, totalSize);
+            // checksummed length
+            dos.writeInt(size);
+            updateChecksumInt(checksum, size);
+            buffer.putInt((int) checksum.getValue());
 
-            CRC32 checksum = new CRC32();
-            final ByteBuffer buffer = alloc.getBuffer();
-            try (BufferedDataOutputStreamPlus dos = new DataOutputBufferFixed(buffer))
-            {
-                // checksummed length
-                dos.writeInt(size);
-                updateChecksumInt(checksum, size);
-                buffer.putInt((int) checksum.getValue());
-
-                // checksummed mutation
-                dos.write(dob.unsafeGetBufferAndFlip());
-                updateChecksum(checksum, buffer, buffer.position() - size, size);
-                buffer.putInt((int) checksum.getValue());
-            }
-            catch (IOException e)
-            {
-                throw new FSWriteError(e, alloc.getSegment().getPath());
-            }
-            finally
-            {
-                alloc.markWritten();
-            }
-
-            executor.finishWriteFor(alloc);
-            return alloc.getCommitLogPosition();
+            // checksummed mutation
+            dos.write(dob.unsafeGetBufferAndFlip());
+            updateChecksum(checksum, buffer, buffer.position() - size, size);
+            buffer.putInt((int) checksum.getValue());
         }
         catch (IOException e)
         {
-            throw new FSWriteError(e, segmentManager.allocatingFrom().getPath());
+            throw new FSWriteError(e, alloc.getSegment().getPath());
         }
+        finally
+        {
+            alloc.markWritten();
+        }
+
+        executor.finishWriteFor(alloc);
+        return alloc;
+    }
+
+    /// The absolute locations of the values of the entry written to `alloc`, or null if `relative` is null or the
+    /// segment is not memory-mapped: only there is the allocation buffer the mapped file itself, so that its offsets
+    /// are file offsets and the bytes are in the file as soon as they are written. Compressed and encrypted segments
+    /// write a transformed copy of their buffer, standard and direct ones write it only when they sync.
+    private static CommitLogValueLocations valueLocations(Allocation alloc, SerializedValueOffsets relative)
+    {
+        CommitLogSegment segment = alloc.getSegment();
+        if (relative == null || !(segment instanceof MemoryMappedSegment))
+            return null;
+        // the allocation buffer duplicates the mapped segment buffer, so its capacity is the mapped size
+        return new CommitLogValueLocations(segment.id,
+                                           segment.logFile,
+                                           alloc.getBuffer().capacity(),
+                                           alloc.getPosition() + ENTRY_HEADER_SIZE,
+                                           relative);
     }
 
     /**

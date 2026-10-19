@@ -1783,7 +1783,7 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
             {
                 try
                 {
-                    timeDelta = mt.checkSpaceAndPut(update, indexer, opGroup);
+                    timeDelta = mt.checkSpaceAndPut(update, indexer, opGroup, context);
                 }
                 finally
                 {
@@ -1792,7 +1792,7 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
             }
             else
             {
-                timeDelta = mt.put(update, indexer, opGroup);
+                timeDelta = mt.put(update, indexer, opGroup, context);
             }
             DecoratedKey key = update.partitionKey();
             invalidateCachedPartition(key);

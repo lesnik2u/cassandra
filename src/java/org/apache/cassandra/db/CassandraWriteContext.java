@@ -24,7 +24,10 @@ import javax.annotation.Nullable;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 
+import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import org.apache.cassandra.db.commitlog.CommitLogValueLocations;
+import org.apache.cassandra.db.commitlog.SerializedValueOffsets;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.utils.concurrent.OpOrder;
@@ -42,6 +45,7 @@ public class CassandraWriteContext implements WriteContext
      * or is aborted in {@link #close()}, never both.
      */
     private final @Nullable Map<Index, Index.PreparedWrite> preparedWrites;
+    private final @Nullable CommitLogValueLocations valueLocations;
 
     // set while a mutation from this context is being applied to a memtable; a context is confined to the
     // thread that applies it, so this needs no synchronisation
@@ -66,12 +70,39 @@ public class CassandraWriteContext implements WriteContext
                                  WriteOrigin origin,
                                  @Nullable Map<Index, Index.PreparedWrite> preparedWrites)
     {
+        this(opGroup, position, writeOptions, origin, preparedWrites, null);
+    }
+
+    public CassandraWriteContext(OpOrder.Group opGroup,
+                                 CommitLogPosition position,
+                                 WriteOptions writeOptions,
+                                 WriteOrigin origin,
+                                 @Nullable Map<Index, Index.PreparedWrite> preparedWrites,
+                                 @Nullable CommitLogValueLocations valueLocations)
+    {
         Preconditions.checkArgument(opGroup != null);
         this.opGroup = opGroup;
         this.position = position;
         this.writeOptions = writeOptions;
         this.origin = origin;
         this.preparedWrites = preparedWrites;
+        this.valueLocations = valueLocations;
+    }
+
+    /// Adds `logged`, the part of a mutation that goes to the commit log, to the commit log and returns the context of
+    /// the write, with the position of the entry and, while [SerializedValueOffsets#ENABLED], where its values were
+    /// written (see [CommitLog#addWithLocations]). The one place that branches on `ENABLED` for anything that appends a
+    /// mutation and wants the locations of its values.
+    public static CassandraWriteContext addToCommitLog(OpOrder.Group opGroup,
+                                                       Mutation logged,
+                                                       WriteOptions writeOptions,
+                                                       WriteOrigin origin,
+                                                       @Nullable Map<Index, Index.PreparedWrite> preparedWrites)
+    {
+        if (!SerializedValueOffsets.ENABLED)
+            return new CassandraWriteContext(opGroup, CommitLog.instance.add(logged), writeOptions, origin, preparedWrites);
+        CommitLog.Added added = CommitLog.instance.addWithLocations(logged);
+        return new CassandraWriteContext(opGroup, added.position, writeOptions, origin, preparedWrites, added.locations);
     }
 
     public static CassandraWriteContext fromContext(WriteContext context)
@@ -88,6 +119,13 @@ public class CassandraWriteContext implements WriteContext
     public CommitLogPosition getPosition()
     {
         return position;
+    }
+
+    /// Where the values of the enclosing mutation were written in the commit log, or null when the write did not go to
+    /// the commit log or value locations are not being recorded.
+    public @Nullable CommitLogValueLocations valueLocations()
+    {
+        return valueLocations;
     }
 
     /**

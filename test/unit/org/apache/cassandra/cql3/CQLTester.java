@@ -3655,19 +3655,6 @@ public abstract class CQLTester
 
     public void withLogAppender(Class<?> clazz, ThrowingConsumer<ListAppender<ILoggingEvent>> logAppenderConsumer) throws Throwable
     {
-        ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(clazz);
-        ListAppender<ILoggingEvent> appender = new ListAppender<>();
-        appender.start();
-        logger.addAppender(appender);
-
-        try
-        {
-            logAppenderConsumer.accept(appender);
-        }
-        finally
-        {
-            logger.detachAppender(appender);
-            appender.stop();
-        }
+        Util.captureLog(clazz, logAppenderConsumer::accept);
     }
 }

@@ -45,6 +45,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
@@ -66,6 +67,8 @@ import org.junit.Assume;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.FieldIdentifier;
@@ -264,6 +267,58 @@ public class Util
         bb.putInt(v);
         bb.rewind();
         return bb;
+    }
+
+    /// `length` bytes from a [Random] seeded with `seed`: the same arguments give the same bytes.
+    public static ByteBuffer randomBytes(int length, long seed)
+    {
+        byte[] b = new byte[length];
+        new Random(seed).nextBytes(b);
+        return ByteBuffer.wrap(b);
+    }
+
+    /// Runs `body` and returns the events logged meanwhile to the logger of `loggerClass`, from any thread.
+    public static List<ILoggingEvent> captureLog(Class<?> loggerClass, Runnable body)
+    {
+        try
+        {
+            return captureLog(loggerClass, appender -> body.run());
+        }
+        catch (Throwable t)
+        {
+            throw Throwables.throwAsUncheckedException(t);
+        }
+    }
+
+    /// A [java.util.function.Consumer] that may throw anything.
+    @FunctionalInterface
+    public interface ThrowingConsumer<T>
+    {
+        void accept(T t) throws Throwable;
+    }
+
+    /// As [#captureLog(Class, Runnable)], giving `body` the appender that collects the events, so that it can read
+    /// those logged so far (synchronized on the appender, as appends are).
+    public static List<ILoggingEvent> captureLog(Class<?> loggerClass, ThrowingConsumer<ListAppender<ILoggingEvent>> body) throws Throwable
+    {
+        ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(loggerClass);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try
+        {
+            body.accept(appender);
+        }
+        finally
+        {
+            logger.detachAppender(appender);
+            appender.stop();
+        }
+        // appends are synchronized on the appender
+        synchronized (appender)
+        {
+            return new ArrayList<>(appender.list);
+        }
     }
 
     /**

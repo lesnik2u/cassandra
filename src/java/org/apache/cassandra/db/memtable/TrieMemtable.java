@@ -23,10 +23,13 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.IntFunction;
 import java.util.function.Predicate;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -36,8 +39,11 @@ import org.slf4j.LoggerFactory;
 
 import org.agrona.concurrent.UnsafeBuffer;
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.ParameterizedClass;
 import org.apache.cassandra.db.BufferDecoratedKey;
+import org.apache.cassandra.db.CassandraWriteContext;
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Columns;
@@ -47,7 +53,10 @@ import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.Slices;
+import org.apache.cassandra.db.WriteContext;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import org.apache.cassandra.db.commitlog.CommitLogValueLocations;
+import org.apache.cassandra.db.commitlog.SerializedValueOffsets;
 import org.apache.cassandra.db.filter.ClusteringIndexFilter;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.marshal.ByteBufferAccessor;
@@ -75,10 +84,13 @@ import org.apache.cassandra.db.tries.TrieDumperWithPath;
 import org.apache.cassandra.db.tries.TrieEntriesWalker;
 import org.apache.cassandra.db.tries.TrieSpaceExhaustedException;
 import org.apache.cassandra.db.tries.TrieTailsIterator;
+import org.apache.cassandra.db.tries.mvcc.CommitLogValueStore;
+import org.apache.cassandra.db.tries.mvcc.FileValueStore;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.Bounds;
 import org.apache.cassandra.dht.IncludingExcludingBounds;
 import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.index.transactions.UpdateTransaction;
 import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.io.sstable.SSTableReadsListener;
@@ -86,10 +98,12 @@ import org.apache.cassandra.metrics.TrieMemtableMetricsView;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.security.EncryptionContext;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.FastByteOperations;
 import org.apache.cassandra.utils.MBeanWrapper;
+import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 import org.apache.cassandra.utils.bytecomparable.ByteSource;
 import org.apache.cassandra.utils.concurrent.OpOrder;
@@ -98,15 +112,23 @@ import org.apache.cassandra.utils.memory.MemoryUtil;
 import org.apache.cassandra.utils.memory.MemtableAllocator;
 import org.apache.cassandra.utils.memory.MemtableBufferAllocator;
 import org.apache.cassandra.utils.memory.NativeAllocator;
+import org.apache.cassandra.utils.memory.NativePool;
 import org.github.jamm.Unmetered;
 
 /// Trie memtable implementation. Improves memory usage, garbage collection efficiency and lookup performance.
 /// The implementation is described in detail in [TrieMemtable.md](./TrieMemtable.md).
 ///
-/// The configuration takes a single parameter:
-/// - shards: the number of shards to split into, defaulting to the number of CPU cores.
+/// The configuration takes the following parameters:
+/// - shards: the number of shards to split into, defaulting to four times the number of CPU cores.
+/// - value_storage: where values that do not fit a trie cell are kept, `native` (default), `file` or `commitlog`, see
+///   [ValueStorage].
 /// Also see [Memtable_API.md](./Memtable_API.md).
-public class TrieMemtable extends AbstractShardedMemtable
+///
+/// `value_storage: file` and `commitlog` are experimental. They keep the values that do not fit a trie cell outside
+/// memtable memory: in a memory-mapped file per shard, or where the write put them in the commit log. The memtable
+/// still charges those value bytes to its off-heap memory, so that the memtable memory limit covers them as if they
+/// were in it. See [Values outside memtable memory](./TrieMemtable.md#values-outside-memtable-memory).
+public class TrieMemtable extends AbstractShardedMemtable implements TrieMemtableMetricsView.ValueLogSource
 {
     private static final Logger logger = LoggerFactory.getLogger(TrieMemtable.class);
 
@@ -121,6 +143,19 @@ public class TrieMemtable extends AbstractShardedMemtable
     public static volatile boolean SHARD_LOCK_FAIRNESS = CassandraRelevantProperties.TRIE_MEMTABLE_SHARD_LOCK_FAIRNESS.getBoolean();
 
     public static final String TRIE_MEMTABLE_CONFIG_OBJECT_NAME = "org.apache.cassandra.db:type=TrieMemtableConfig";
+
+    public static final String VALUE_STORAGE_OPTION = "value_storage";
+
+    /// Distinguishes the value stores of successive memtables of the same table.
+    private static final AtomicLong VALUE_LOG_SEQ = new AtomicLong();
+
+    /// Whether this process writes through a commit log, so that `commitlog` value storage must check its
+    /// configuration and record value locations. Offline tools do not: they never write through a memtable, and do not
+    /// resolve the commit log disk access mode.
+    private static boolean writesThroughCommitLog()
+    {
+        return DatabaseDescriptor.isDaemonInitialized() && DatabaseDescriptor.getCommitLogWriteDiskAccessMode() != null;
+    }
 
     static
     {
@@ -148,27 +183,63 @@ public class TrieMemtable extends AbstractShardedMemtable
     @Unmetered
     private final TableMetadata actualMetadata;
 
-    TrieMemtable(AtomicReference<CommitLogPosition> commitLogLowerBound, TableMetadataRef metadataRef, Owner owner, Integer shardCountOption)
+    private final ValueStorage valueStorage;
+
+    TrieMemtable(AtomicReference<CommitLogPosition> commitLogLowerBound, TableMetadataRef metadataRef, Owner owner,
+                 Integer shardCountOption, ValueStorage valueStorage)
+    {
+        this(commitLogLowerBound, metadataRef, owner, shardCountOption, valueStorage, null);
+    }
+
+    /// `cellDataManagers`, if not null, creates the cell data manager of each shard instead of
+    /// [ValueStorage#newCellDataManager].
+    @VisibleForTesting
+    TrieMemtable(AtomicReference<CommitLogPosition> commitLogLowerBound, TableMetadataRef metadataRef, Owner owner,
+                 Integer shardCountOption, ValueStorage valueStorage, IntFunction<CellDataBufferManager> cellDataManagers)
     {
         super(commitLogLowerBound, metadataRef, owner, shardCountOption);
+        // factory() already rejects this; checked again in case the pool and the configuration disagree
+        if (valueStorage != ValueStorage.NATIVE && !(MEMORY_POOL instanceof NativePool))
+            throw new ConfigurationException(valueStorage.requiresOffheapObjectsMessage());
+        this.valueStorage = valueStorage;
         this.metrics = TrieMemtableMetricsView.getOrCreate(metadataRef.keyspace, metadataRef.name);
         this.actualMetadata = metadataRef.get();
-        this.shards = generatePartitionShards(boundaries.shardCount(), actualMetadata, metrics, owner.readOrdering());
+        TableMetadata tableMetadata = actualMetadata;
+        long memtableSeq = VALUE_LOG_SEQ.incrementAndGet();
+        this.shards = generatePartitionShards(boundaries.shardCount(), actualMetadata, metrics, owner.readOrdering(),
+                                              cellDataManagers != null
+                                              ? cellDataManagers
+                                              : shard -> valueStorage.newCellDataManager(tableMetadata, memtableSeq, shard));
         this.mergedTrie = makeMergedTrie(shards);
+        if (valueStorage != ValueStorage.NATIVE)
+            metrics.addValueLogSource(this);
         logger.trace("Created memtable with {} shards", this.shards.length);
     }
 
     private static MemtableShard[] generatePartitionShards(int splits,
                                                            TableMetadata metadata,
                                                            TrieMemtableMetricsView metrics,
-                                                           OpOrder opOrder)
+                                                           OpOrder opOrder,
+                                                           IntFunction<CellDataBufferManager> cellDataManagers)
     {
-        if (splits == 1)
-            return new MemtableShard[] { new MemtableShard(metadata, metrics, opOrder) };
-
         MemtableShard[] partitionMapContainer = new MemtableShard[splits];
-        for (int i = 0; i < splits; i++)
-            partitionMapContainer[i] = new MemtableShard(metadata, metrics, opOrder);
+        CellDataBufferManager[] managers = new CellDataBufferManager[splits];
+        try
+        {
+            for (int i = 0; i < splits; i++)
+            {
+                managers[i] = cellDataManagers.apply(i);
+                partitionMapContainer[i] = new MemtableShard(metadata, metrics, opOrder, managers[i]);
+            }
+        }
+        catch (Throwable t)
+        {
+            // The memtable will not be published, so discard() will not run: release the stores created so far.
+            for (CellDataBufferManager manager : managers)
+                if (manager != null)
+                    t = Throwables.perform(t, manager::close);
+            throw Throwables.throwAsUncheckedException(t);
+        }
 
         return partitionMapContainer;
     }
@@ -221,6 +292,8 @@ public class TrieMemtable extends AbstractShardedMemtable
     public void discard()
     {
         super.discard();
+        if (valueStorage != ValueStorage.NATIVE)
+            metrics.removeValueLogSource(this);
         // metrics here are not thread safe, but I think we can live with that
         metrics.lastFlushShardDataSizes.reset();
         for (MemtableShard shard : shards)
@@ -228,11 +301,24 @@ public class TrieMemtable extends AbstractShardedMemtable
             metrics.lastFlushShardDataSizes.update(shard.liveDataSize());
         }
         // the buffer release is a longer-running process, do it in a separate loop to not make the metrics update wait
-        for (MemtableShard shard : shards)
+        Throwable fail = null;
+        try
         {
-            shard.allocator.setDiscarded();
-            shard.data.discardBuffers();
+            for (MemtableShard shard : shards)
+            {
+                shard.allocator.setDiscarded();
+                shard.data.discardBuffers();
+            }
         }
+        catch (Throwable t)
+        {
+            fail = t;
+        }
+        // close the stores outside memtable memory last, so that a failure cannot prevent releasing memtable memory,
+        // and also if releasing memtable memory failed
+        for (MemtableShard shard : shards)
+            fail = Throwables.perform(fail, shard.cellDataBufferManager::close);
+        Throwables.maybeFail(fail);
     }
 
     @Override
@@ -247,17 +333,28 @@ public class TrieMemtable extends AbstractShardedMemtable
         }
     }
 
+    /// As [#put(PartitionUpdate, UpdateTransaction, OpOrder.Group, WriteContext)] without a write context.
+    @Override
+    public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
+    {
+        return put(update, indexer, opGroup, null);
+    }
+
     /// Should only be called by [ColumnFamilyStore#apply] via `Keyspace#apply`, which supplies the appropriate
     /// [OpOrder.Group].
     ///
     /// `commitLogSegmentPosition` should only be null if this is a secondary index, in which case it is *expected* to
     /// be null.
+    ///
+    /// The context's [CassandraWriteContext#valueLocations], if any, let `commitlog` value storage refer to the
+    /// update's values in the commit log segment they were written to.
     @Override
-    public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
+    public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup, WriteContext context)
     {
         DecoratedKey key = update.partitionKey();
         MemtableShard shard = shards[boundaries.getShardForKey(key)];
-        long colUpdateTimeDelta = shard.put(update, indexer, opGroup);
+        CommitLogValueLocations valueLocations = context instanceof CassandraWriteContext ? ((CassandraWriteContext) context).valueLocations() : null;
+        long colUpdateTimeDelta = shard.put(update, indexer, opGroup, valueLocations);
 
         if (shard.data.reachedAllocatedSizeThreshold())
             signalFlushRequired(ColumnFamilyStore.FlushReason.TRIE_LIMIT, true);
@@ -294,6 +391,33 @@ public class TrieMemtable extends AbstractShardedMemtable
         long total = 0L;
         for (MemtableShard shard : shards)
             total += shard.liveDataSize();
+        return total;
+    }
+
+    @VisibleForTesting
+    ValueStorage valueStorage()
+    {
+        return valueStorage;
+    }
+
+    /// Value bytes written to the per-shard value stores (0 for `native`). Written, not live, bytes.
+    @Override
+    public long valueLogBytes()
+    {
+        long total = 0;
+        for (MemtableShard shard : shards)
+            total += shard.cellDataBufferManager.valueLogBytes();
+        return total;
+    }
+
+    /// The part of [#valueLogBytes] that `commitlog` value storage copied because it could not refer to the values in
+    /// the commit log (0 for `native` and `file`).
+    @Override
+    public long valueLogFallbackBytes()
+    {
+        long total = 0;
+        for (MemtableShard shard : shards)
+            total += shard.cellDataBufferManager.fallbackBytes();
         return total;
     }
 
@@ -684,17 +808,26 @@ public class TrieMemtable extends AbstractShardedMemtable
         private TriePartitionUpdater noIndexUpdater;
         private TriePartitionUpdaterLegacyIndex legacyIndexUpdater;
 
-        MemtableShard(TableMetadata metadata, TrieMemtableMetricsView metrics, OpOrder opOrder)
+        MemtableShard(TableMetadata metadata, TrieMemtableMetricsView metrics, OpOrder opOrder, CellDataBufferManager cellDataManager)
         {
-            this(metadata, AbstractAllocatorMemtable.MEMORY_POOL.newAllocator(metadata.toString()), metrics, opOrder);
+            this(metadata, AbstractAllocatorMemtable.MEMORY_POOL.newAllocator(metadata.toString()), metrics, opOrder, cellDataManager);
         }
 
         @VisibleForTesting
         MemtableShard(TableMetadata metadata, MemtableAllocator allocator, TrieMemtableMetricsView metrics, OpOrder opOrder)
         {
+            this(metadata, allocator, metrics, opOrder, null);
+        }
+
+        /// `cellDataManager` null selects the manager matching the allocator (values in memtable memory).
+        MemtableShard(TableMetadata metadata, MemtableAllocator allocator, TrieMemtableMetricsView metrics, OpOrder opOrder,
+                      CellDataBufferManager cellDataManager)
+        {
             this.metadata = metadata;
             this.allocator = allocator;
-            if (this.allocator instanceof NativeAllocator)
+            if (cellDataManager != null)
+                this.cellDataBufferManager = cellDataManager;
+            else if (this.allocator instanceof NativeAllocator)
                 this.cellDataBufferManager = new NativeBufferManager((NativeAllocator) allocator);
             else
                 this.cellDataBufferManager = new SlabBufferManager((MemtableBufferAllocator) allocator,
@@ -725,7 +858,8 @@ public class TrieMemtable extends AbstractShardedMemtable
             }
         }
 
-        public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
+        /// `valueLocations` is where the update's values were written in the commit log, or null.
+        public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup, CommitLogValueLocations valueLocations)
         {
             // If the update is not TriePartitionUpdate, convert it to one before taking the lock.
             DeletionAwareTrie<Object, TrieTombstoneMarker> mergableTrie = TriePartitionUpdate.asMergableTrie(update);
@@ -749,6 +883,7 @@ public class TrieMemtable extends AbstractShardedMemtable
                 try
                 {
                     this.cellDataBufferManager.opOrderGroup = opGroup;
+                    this.cellDataBufferManager.valueLocations = valueLocations;
                     int partitionsAdded = mergeUpdate(data,
                                                       allocator,
                                                       mergableTrie,
@@ -759,6 +894,8 @@ public class TrieMemtable extends AbstractShardedMemtable
                 }
                 finally
                 {
+                    // do not keep the update's cached serialization reachable from the shard
+                    this.cellDataBufferManager.valueLocations = null;
                     indexer.commit();
                     updateMinTimestamp(update.stats().minTimestamp);
                     updateLiveDataSize(updater.dataSize);
@@ -845,6 +982,8 @@ public class TrieMemtable extends AbstractShardedMemtable
         // Add the initial trie size on the first operation. This technically isn't correct (other shards
         // do take their memory share even if they are empty) but doing it during construction may cause
         // the allocator to block while we are trying to flush a memtable and become a deadlock.
+        // A first put that aborts after its values were appended to a store outside memtable memory leaves the trie
+        // empty, so the next put charges those bytes again: this only over-counts, and the discard releases it.
         long onHeap = dataTrie.isEmpty() ? 0 : dataTrie.usedSizeOnHeap();
         long offHeap = dataTrie.isEmpty() ? 0 : dataTrie.usedSizeOffHeap();
         try
@@ -954,7 +1093,11 @@ public class TrieMemtable extends AbstractShardedMemtable
     {
         String shardsString = optionsCopy.remove(SHARDS_OPTION);
         Integer shardCount = shardsString != null ? Integer.parseInt(shardsString) : null;
-        return new TrieMemtableFactory(shardCount);
+
+        ValueStorage valueStorage = ValueStorage.fromOption(optionsCopy.remove(VALUE_STORAGE_OPTION));
+        valueStorage.validate();
+        valueStorage.onAccepted();
+        return new TrieMemtableFactory(shardCount, valueStorage);
     }
 
     @Override
@@ -1329,11 +1472,13 @@ public class TrieMemtable extends AbstractShardedMemtable
             return manager.onHeapSize();
         }
 
+        /// The values a store outside memtable memory holds are counted as off-heap memory, so that the per-update
+        /// adjustment in [TrieMemtable#mergeUpdate] charges them to the shard's allocator. Values kept in memtable
+        /// memory are charged by the allocator that holds them, and the native managers report 0.
         @Override
         public long usedSizeOffHeap()
         {
-            // managed separately in allocator
-            return 0;
+            return manager.valueLogBytes();
         }
 
         @Override
@@ -1378,6 +1523,11 @@ public class TrieMemtable extends AbstractShardedMemtable
     {
         OpOrder.Group opOrderGroup;
 
+        /// Where the values of the put in progress were written in the commit log, or null. Set by the shard's writer
+        /// under the shard's write lock before the values of an update are stored, and cleared after them, also when
+        /// the put fails.
+        CommitLogValueLocations valueLocations;
+
         /// On-heap size of any additional structures used to store the references to data
         abstract long onHeapSize();
 
@@ -1396,6 +1546,27 @@ public class TrieMemtable extends AbstractShardedMemtable
         /// See [org.apache.cassandra.db.tries.ContentManager#releaseReferencesUnsafe]
         @VisibleForTesting
         abstract void releaseReferencesUnsafe();
+
+        /// Value bytes this manager has written outside memtable memory: a non-decreasing counter, charged to the
+        /// shard's off-heap memory (see [TrieSerializer#usedSizeOffHeap]) and read without synchronisation by the
+        /// metrics gauge, which may still read it after [#close].
+        long valueLogBytes()
+        {
+            return 0;
+        }
+
+        /// The part of [#valueLogBytes] that was copied because it could not be referenced where the write put it.
+        /// Same threading as [#valueLogBytes].
+        long fallbackBytes()
+        {
+            return 0;
+        }
+
+        /// Release any resources outside the memtable allocator. Called from [TrieMemtable#discard] after the memtable
+        /// memory is released. Must be idempotent and should not throw.
+        void close()
+        {
+        }
     }
 
     /// Buffer manager for cell data, used to store data that does not fit the 15 bytes for value in the trie block.
@@ -1597,6 +1768,149 @@ public class TrieMemtable extends AbstractShardedMemtable
         public String deletionToString(TrieTombstoneMarker deletionMarker)
         {
             return deletionMarker.toString();
+        }
+    }
+
+    /// Where values that do not fit a trie cell are kept: memtable memory (`native`, the default), an append-only
+    /// per-shard store outside memtable memory (`file`; requires `offheap_objects`), or the commit log segments the
+    /// values were written to, with such a store as fallback (`commitlog`; see [#COMMITLOG]).
+    public enum ValueStorage
+    {
+        NATIVE
+        {
+            @Override
+            CellDataBufferManager newCellDataManager(TableMetadata metadata, long memtableSeq, int shard)
+            {
+                return null;   // the shard picks NativeBufferManager / SlabBufferManager from its allocator
+            }
+        },
+        FILE
+        {
+            @Override
+            CellDataBufferManager newCellDataManager(TableMetadata metadata, long memtableSeq, int shard)
+            {
+                return new ValueStoreCellDataManager(FileValueStore.forShard(metadata, memtableSeq, shard));
+            }
+
+            @Override
+            void onAccepted()
+            {
+                if (warned.compareAndSet(false, true))
+                    logger.warn("TrieMemtable {}=file: file and commitlog value storage are experimental. Values are kept in files " +
+                                "under the commit log directory, outside memtable memory, but count toward memtable_offheap_space: " +
+                                "such a table flushes at the same value volume as with native storage unless memtable_offheap_space " +
+                                "is raised, which raises the memory ceiling of native tables too, and MemtableOffHeapDataSize, " +
+                                "AllMemtablesOffHeapDataSize and the memtable pool metrics include value bytes that are on disk and " +
+                                "in the page cache rather than in memtable memory.",
+                                VALUE_STORAGE_OPTION);
+            }
+        },
+        /// Values are referenced in the memory-mapped commit log segment the write put them in, which the memtable
+        /// keeps mapped until it is discarded, and copied as with [#FILE] when they cannot be found there. Requires
+        /// `offheap_objects` and an uncompressed, unencrypted commit log with `commitlog_disk_access_mode: mmap`.
+        /// Accepting it in a process that writes through the commit log turns on [SerializedValueOffsets#ENABLED] for
+        /// the whole node until it restarts. See [`commitlog` value storage](./TrieMemtable.md#commitlog-value-storage).
+        COMMITLOG
+        {
+            @Override
+            CellDataBufferManager newCellDataManager(TableMetadata metadata, long memtableSeq, int shard)
+            {
+                return new ValueStoreCellDataManager(new CommitLogValueStore(FileValueStore.forShard(metadata, memtableSeq, shard)));
+            }
+
+            @Override
+            void validate()
+            {
+                super.validate();
+                if (!writesThroughCommitLog())
+                    return;
+                ParameterizedClass compression = DatabaseDescriptor.getCommitLogCompression();
+                if (compression != null)
+                    throw new ConfigurationException(String.format("TrieMemtable %s=commitlog requires an uncompressed commit log (configured commitlog_compression: %s)",
+                                                                   VALUE_STORAGE_OPTION, compression.class_name));
+                EncryptionContext encryption = DatabaseDescriptor.getEncryptionContext();
+                if (encryption != null && encryption.isEnabled())
+                    throw new ConfigurationException(String.format("TrieMemtable %s=commitlog requires an unencrypted commit log (transparent_data_encryption_options is enabled)",
+                                                                   VALUE_STORAGE_OPTION));
+                Config.DiskAccessMode accessMode = DatabaseDescriptor.getCommitLogWriteDiskAccessMode();
+                if (accessMode != Config.DiskAccessMode.mmap)
+                    throw new ConfigurationException(String.format("TrieMemtable %s=commitlog requires commitlog_disk_access_mode: mmap, but it is %s (auto is direct where direct I/O is supported; set legacy or mmap)",
+                                                                   VALUE_STORAGE_OPTION, accessMode));
+            }
+
+            @Override
+            void onAccepted()
+            {
+                if (writesThroughCommitLog())
+                    SerializedValueOffsets.ENABLED = true;
+                if (warned.compareAndSet(false, true))
+                    logger.warn("TrieMemtable {}=commitlog: file and commitlog value storage are experimental. Values are kept outside " +
+                                "memtable memory, in the commit log segments they were written to, or in files under the commit log " +
+                                "directory for the values that cannot be referenced there, but count toward memtable_offheap_space: " +
+                                "such a table flushes at the same value volume as with native storage unless memtable_offheap_space " +
+                                "is raised, which raises the memory ceiling of native tables too, and MemtableOffHeapDataSize, " +
+                                "AllMemtablesOffHeapDataSize and the memtable pool metrics include value bytes that are on disk and " +
+                                "in the page cache rather than in memtable memory.",
+                                VALUE_STORAGE_OPTION);
+            }
+        };
+
+        /// Set once the warning that this value storage is experimental has been logged; never set for [#NATIVE].
+        /// Package-private so that the constant bodies can reach it.
+        final AtomicBoolean warned = new AtomicBoolean();
+
+        /// The value storage named by the `value_storage` option `option`, ignoring case; [#NATIVE] if it is null.
+        static ValueStorage fromOption(String option)
+        {
+            if (option == null)
+                return NATIVE;
+            try
+            {
+                return valueOf(option.trim().toUpperCase(Locale.ROOT));
+            }
+            catch (IllegalArgumentException e)
+            {
+                StringBuilder expected = new StringBuilder();
+                for (ValueStorage storage : values())
+                    expected.append(expected.length() == 0 ? "" : ", ").append(storage.name().toLowerCase(Locale.ROOT));
+                throw new ConfigurationException(String.format("Invalid %s '%s' for TrieMemtable; expected one of %s",
+                                                               VALUE_STORAGE_OPTION, option, expected));
+            }
+        }
+
+        /// The cell data manager for one shard, or null to keep values in memtable memory. This is the only place
+        /// that knows which store a constant maps to.
+        abstract CellDataBufferManager newCellDataManager(TableMetadata metadata, long memtableSeq, int shard);
+
+        /// Checks the configuration this value storage needs, so that an invalid setting is reported when the memtable
+        /// is configured rather than when the first store is created.
+        void validate()
+        {
+            if (this != NATIVE && DatabaseDescriptor.getMemtableAllocationType() != Config.MemtableAllocationType.offheap_objects)
+                throw new ConfigurationException(requiresOffheapObjectsMessage());
+        }
+
+        /// Called by [TrieMemtable#factory] once the configuration has been accepted: [#FILE] and [#COMMITLOG] log,
+        /// once each, that they are experimental, and [#COMMITLOG] turns on [SerializedValueOffsets#ENABLED] in a
+        /// process that writes through the commit log.
+        void onAccepted()
+        {
+        }
+
+        private String requiresOffheapObjectsMessage()
+        {
+            return String.format("TrieMemtable %s=%s requires memtable_allocation_type: offheap_objects (configured: %s)",
+                                 VALUE_STORAGE_OPTION,
+                                 name().toLowerCase(Locale.ROOT),
+                                 DatabaseDescriptor.getMemtableAllocationType());
+        }
+
+        /// Lets every value storage log its warning again.
+        @VisibleForTesting
+        static void resetWarnings()
+        {
+            for (ValueStorage valueStorage : values())
+                valueStorage.warned.set(false);
         }
     }
 }
